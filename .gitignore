@@ -1,28 +1,28 @@
-# Abaikan virtual environments
+# Ignore env
 env/
 venv/
 
-# Abaikan __pycache__ dan file Python bytecode
+# Ignore Python cache
 __pycache__/
 *.py[cod]
 *$py.class
 
-# Abaikan file environment
+# Ignore dotenv files
 .env
 
-# Abaikan file konfigurasi editor (opsional)
+# Ignore editor settings
 .vscode/
 
-# Abaikan semua isi dalam folder data/
+# Ignore everything in data/
 data/*
 
-# Kecualikan folder chunkpdf dan semua isinya
+# But NOT data/chunkpdf and its contents
 !data/chunkpdf/
 !data/chunkpdf/**
 
-# Abaikan semua isi dalam folder app/static/
+# Ignore everything in app/static/
 app/static/*
 
-# Kecualikan folder pdf_images dan semua isinya
+# But NOT app/static/pdf_images and its contents
 !app/static/pdf_images/
 !app/static/pdf_images/**
