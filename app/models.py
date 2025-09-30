@@ -149,6 +149,7 @@ class PdfDocument(db.Model):
 
     id = db.Column(Uuid, primary_key=True, default=uuid.uuid4)
     filename = db.Column(String(255), nullable=False, index=True)
+    link = db.Column(Text, nullable=True)
     total_pages = db.Column(Integer, nullable=True)
     document_hash = db.Column(String(64), nullable=True, unique=True)
     doc_metadata = db.Column(JSON, nullable=True) # Metadata tambahan (misal: penulis, tanggal publikasi)

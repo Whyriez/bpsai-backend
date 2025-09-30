@@ -20,22 +20,28 @@ def get_all_documents():
     try:
         page = request.args.get('page', 1, type=int)
         per_page = request.args.get('per_page', 10, type=int)
-        paginated_docs = PdfDocument.query.order_by(PdfDocument.created_at.desc()).paginate(
+        search_term = request.args.get('search', None, type=str)
+        query = PdfDocument.query
+
+        if search_term:
+            # Gunakan ilike untuk pencarian case-insensitive
+            query = query.filter(PdfDocument.filename.ilike(f"%{search_term}%"))
+
+        paginated_docs = query.order_by(PdfDocument.created_at.desc()).paginate(
             page=page, 
             per_page=per_page, 
             error_out=False
         )
         
-        # 'paginated_docs.items' berisi daftar dokumen untuk halaman saat ini
         documents_on_page = paginated_docs.items
         
         results = []
         for doc in documents_on_page:
-            # Kalkulasi ini sekarang hanya berjalan untuk item di halaman saat ini
             table_page_count = sum(1 for chunk in doc.chunks if chunk.chunk_metadata and chunk.chunk_metadata.get('type') == 'table')
             results.append({
                 "id": doc.id,
                 "filename": doc.filename,
+                "link": doc.link,
                 "total_pages": doc.total_pages,
                 "table_page_count": table_page_count,
                 "processed_at": doc.created_at.isoformat()
@@ -54,7 +60,42 @@ def get_all_documents():
         }), 200
     except Exception as e:
         return jsonify({"error": "Gagal mengambil data dokumen", "details": str(e)}), 500
-    
+
+@document_bp.route('/<uuid:document_id>', methods=['PUT'])
+# @jwt_required()
+def update_document_details(document_id):
+    """
+    Memperbarui field filename dan/atau link untuk sebuah dokumen.
+    """
+    try:
+        data = request.get_json()
+        if not data:
+            return jsonify({"error": "Request body tidak boleh kosong"}), 400
+
+        doc = db.get_or_404(PdfDocument, document_id)
+        
+        # Update field jika ada di dalam data request
+        if 'filename' in data:
+            doc.filename = data['filename']
+        if 'link' in data:
+            doc.link = data['link']
+        
+        db.session.commit()
+        
+        return jsonify({
+            "message": f"Detail untuk dokumen '{doc.filename}' berhasil diperbarui.",
+            "document": {
+                "id": doc.id,
+                "filename": doc.filename,
+                "link": doc.link
+            }
+        }), 200
+
+    except Exception as e:
+        db.session.rollback()
+        current_app.logger.error(f"Error updating details for document {document_id}: {e}")
+        return jsonify({"error": "Gagal memperbarui detail dokumen", "details": str(e)}), 500
+
 @document_bp.route('/<uuid:document_id>', methods=['DELETE'])
 # @jwt_required() # Sangat disarankan untuk mengaktifkan ini untuk keamanan
 def delete_document(document_id):

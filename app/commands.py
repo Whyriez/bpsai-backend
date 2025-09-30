@@ -72,3 +72,4 @@ def register_commands(app):
 
             db.session.commit()
             click.echo("Database seeded!")
+            

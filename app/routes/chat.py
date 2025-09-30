@@ -10,7 +10,7 @@ from app.helpers import (
     extract_years, detect_intent, extract_keywords, build_context,
     build_final_prompt, expand_query_with_synonyms, BPS_ACRONYM_DICTIONARY,
     format_conversation_history,
-    rerank_with_dss 
+    rerank_with_dss
 )
 from sqlalchemy.orm import aliased
 
@@ -65,15 +65,9 @@ def stream():
     if not user_prompt or not session_id:
         return Response(json.dumps({'error': 'Prompt and conversation_id are required'}), status=400, mimetype='application/json')
 
-    recent_history_logs = PromptLog.query.filter(
-        PromptLog.session_id == session_id,
-        PromptLog.model_response.isnot(None),
-        ~PromptLog.model_response.ilike('data:%'),
-        ~PromptLog.model_response.ilike('error%')
-    ).order_by(PromptLog.id.desc()).limit(10).all()
+    db.session.expire_all()
 
-    history_context = format_conversation_history(recent_history_logs)
-
+    # 1. SIMPAN PERTANYAAN BARU DULU
     log = PromptLog(
         user_prompt=user_prompt,
         session_id=session_id,
@@ -85,18 +79,30 @@ def stream():
     db.session.commit()
     log_id = log.id
 
-    try:
-        # DIUBAH: Panggil fungsi pencarian gabungan yang baru
-        relevant_items = get_combined_relevant_results(user_prompt, limit=15)
+    # 2. BARU AMBIL RIWAYAT (sekarang sudah termasuk pertanyaan baru)
+    
 
+    try:
+        recent_history_logs = PromptLog.query.filter(
+            PromptLog.session_id == session_id,
+            PromptLog.model_response.isnot(None),
+            ~PromptLog.model_response.ilike('data:%'),
+            ~PromptLog.model_response.ilike('error%')
+        ).order_by(PromptLog.id.desc()).limit(4).all()  # Gunakan asc untuk urutan kronologis
+
+        recent_history_logs.reverse() 
+
+        history_context = format_conversation_history(recent_history_logs)
+        # Lanjutkan dengan proses pencarian dan streaming...
+        relevant_items = get_combined_relevant_results(user_prompt, limit=15)
+        
         items_to_rerank = [(item, dist) for item, dist in relevant_items]
         relevant_items = rerank_with_dss(items_to_rerank)
         
-        # Fungsi build_context (di helpers.py) akan menangani item-item ini
         context = build_context(relevant_items, log.extracted_years)
         final_prompt = build_final_prompt(context, user_prompt, history_context)
 
-        # DIUBAH: Log ID dari sumber yang berbeda
+        # Simpan retrieved_ids...
         retrieved_ids = []
         for item in relevant_items:
             if isinstance(item, BeritaBps):
@@ -106,12 +112,14 @@ def stream():
 
         log.found_results = bool(relevant_items)
         log.retrieved_news_count = len(relevant_items)
-        log.retrieved_news_ids = retrieved_ids # Simpan ID yang sudah terstruktur
+        log.retrieved_news_ids = retrieved_ids
         log.final_prompt = final_prompt
         db.session.commit()
 
+        # Streaming response...
         app = current_app._get_current_object()
         model_response_buffer = ""
+        
         def generate():
             nonlocal model_response_buffer
             try:
@@ -121,7 +129,7 @@ def stream():
                     except GeneratorExit:
                         current_app.logger.info(f"Client disconnected for session {session_id}. Stopping stream.")
                         break 
-                
+                    
                     if chunk.strip().startswith('data: '):
                         json_str = chunk.strip()[6:]
                         if json_str and json_str != '[DONE]':

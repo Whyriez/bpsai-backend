@@ -177,68 +177,142 @@ def build_context(relevant_items: list, requested_years: list = []) -> str:
 
 
 def format_conversation_history(history: list[PromptLog]) -> str:
-    """Mengubah daftar objek PromptLog menjadi string riwayat percakapan."""
+    """
+    Format riwayat percakapan dengan struktur yang LEBIH JELAS.
+    Sekarang fokus pada interaksi yang paling relevan.
+    """
     if not history:
         return ""
-    
-    formatted_history = "### RIWAYAT PERCAKAPAN SEBELUMNYA ###\n\n"
-    
-    for i, log in enumerate(history):
-        if (log.user_prompt and log.model_response and 
+
+    # Filter log yang valid
+    valid_logs = [
+        log for log in history
+        if (log.user_prompt and log.model_response and
             not log.model_response.lower().strip().startswith('error') and
-            not log.model_response.lower().strip().startswith('data:')):
-            
-            formatted_history += f"**Interaksi {i + 1}:**\n"
-            formatted_history += f"User: {log.user_prompt}\n"
-            formatted_history += f"Asisten: {log.model_response}\n\n"
-    
-    if formatted_history != "### RIWAYAT PERCAKAPAN SEBELUMNYA ###\n\n":
-        formatted_history += "**CATATAN PENTING:** Jawablah pertanyaan user saat ini dengan mempertimbangkan konteks dari seluruh riwayat percakapan di atas.\n\n"
-    else:
-        formatted_history = ""
+            not log.model_response.lower().strip().startswith('data:'))
+    ]
+
+    if not valid_logs:
+        return ""
+
+    formatted_history = ""
+
+    # **FIX: Untuk riwayat dengan beberapa interaksi**
+    if len(valid_logs) >= 2:
+        # Ambil 2 interaksi terakhir dari riwayat yang ada
+        recent_interactions = valid_logs[-2:]
         
+        formatted_history += "### Dua Interaksi Terakhir ###\n\n"
+        for i, log in enumerate(recent_interactions):
+            indicator = "PERTANYAAN TERAKHIR" if i == len(recent_interactions)-1 else "SEBELUMNYA"
+            formatted_history += f"**{indicator}:** {log.user_prompt}\n"
+            formatted_history += f"**JAWABAN:** {log.model_response}\n\n"
+    
+    else:
+        # Hanya ada 1 interaksi dalam riwayat
+        single_log = valid_logs[-1]
+        formatted_history += "### Interaksi Terakhir ###\n\n"
+        formatted_history += f"**PERTANYAAN:** {single_log.user_prompt}\n"
+        formatted_history += f"**JAWABAN:** {single_log.model_response}\n\n"
+
     return formatted_history
 
 def build_final_prompt(context: str, user_prompt: str, history_context: str = "") -> str:
-    """Membangun prompt final yang akan dikirim ke Gemini dengan instruksi yang lebih tegas dan spesifik."""
+    """
+    Membangun prompt final yang akan dikirim ke Gemini dengan instruksi yang lebih tegas dan spesifik,
+    termasuk logika untuk mengajukan pertanyaan klarifikasi jika permintaan terlalu umum.
+    """
     full_context = history_context + context if history_context else context
 
     return f"""
-Kamu adalah Asisten AI Data dari BPS Provinsi Gorontalo. Misi utama kamu adalah menyajikan data secara akurat dan dalam format yang paling mudah dibaca.
+Kamu adalah Asisten AI Data dari Badan Pusat Statistik (BPS) Provinsi Gorontalo. Misi utama kamu adalah menjawab pertanyaan pengguna secara akurat, detail, dan terpercaya berdasarkan data yang disediakan.
 
 {history_context}
 
---- Konteks Data Relevan (Sumber Utama Jawaban) ---
+--- SUMBER DATA (Gunakan HANYA informasi dari sini untuk menjawab) ---
 {context}
---- Akhir Konteks Data ---
+--- AKHIR SUMBER DATA ---
 
-**Pertanyaan Pengguna:** {user_prompt}
+**Pertanyaan Pengguna Saat Ini:** {user_prompt}
 
+## INSTRUKSI UTAMA (WAJIB DIIKUTI SECARA BERURUTAN)
+
+### 0. Klarifikasi Pertanyaan (Lakukan Ini Terlebih Dahulu):
+- **Kondisi:** Jika pertanyaan pengguna bersifat umum (contoh: 'data NTP', 'info penduduk') DAN 'SUMBER DATA' yang ditemukan mencakup beberapa periode waktu (tahun/bulan) atau beberapa kategori (seperti jenis kelamin, kelompok umur, dll).
+- **Tindakan:** MAKA JANGAN LANGSUNG JAWAB. Sebaliknya, AJUKAN PERTANYAAN KLARIFIKASI terlebih dahulu untuk mempersempit kebutuhan pengguna. Gunakan informasi dari 'SUMBER DATA' untuk memberikan opsi kepada pengguna.
+- **Contoh 1:** Jika user bertanya "data NTP" dan konteks berisi data NTP 2023 dan 2024, JAWAB: "Tentu, saya bisa bantu. Data Nilai Tukar Petani (NTP) yang saya miliki tersedia untuk tahun 2023 dan 2024. Anda memerlukan data untuk tahun spesifik atau perbandingan keduanya?"
+- **Contoh 2:** Jika user bertanya "data penduduk" dan konteks berisi data penduduk menurut jenis kelamin dan kelompok umur, JAWAB: "Baik. Untuk data penduduk, saya memiliki rincian berdasarkan jenis kelamin dan kelompok umur. Informasi spesifik apa yang Anda butuhkan?"
+- **Pengecualian:** Jika pertanyaan pengguna sudah spesifik (contoh: 'data NTP Gorontalo tahun 2024'), lewati langkah ini dan langsung ikuti Aturan 1 dan 2 di bawah ini.
+
+### 1. Aturan untuk Menjawab Pertanyaan Data (Jika tidak perlu klarifikasi):
+1.  **Akurasi adalah Segalanya:** JAWAB HANYA berdasarkan informasi dari bagian 'SUMBER DATA'. Jangan berasumsi atau menggunakan pengetahuan di luar konteks yang diberikan.
+2.  **Jawaban Detail dan Lengkap:** Berikan jawaban yang detail dan selengkap mungkin. Jika data tersedia dalam bentuk tabel di dalam konteks, sajikan kembali dalam format tabel Markdown yang rapi.
+3.  **Sebutkan Sumber (Sangat Penting):** SELALU sebutkan dari mana data berasal.
+    * Jika informasi dari **dokumen PDF**, sebutkan nama file dan nomor halamannya. **Contoh:** "Menurut dokumen 'Berita Resmi Statistik Gorontalo 2024.pdf' halaman 5..."
+    * Jika informasi dari **berita**, sebutkan judul beritanya. **Contoh:** "Berdasarkan berita berjudul 'Perkembangan Indeks Harga Konsumen Oktober 2024'..."
+4.  **Sertakan Link:** Jika 'SUMBER DATA' menyediakan `Link:` untuk sebuah berita, WAJIB sertakan link tersebut di akhir jawaban Anda.
+5.  **Jika Data Tidak Ada:** Jika informasi yang diminta tidak ditemukan di 'SUMBER DATA', jawab dengan jujur bahwa data tersebut tidak tersedia dalam konteks yang Anda miliki.
+
+### 2. Aturan untuk Menangani Pertanyaan Riwayat:
+1.  **PERTANYAAN "APA YANG SAYA TANYAKAN TADI?":**
+    * Jika pengguna bertanya "apa yang saya tanyakan tadi?" atau variasi serupa, **WAJIB merujuk HANYA pada PERTANYAAN TERAKHIR** sebelum pertanyaan ini.
+    * **JAWABAN CONTOH YANG BENAR:** "Pertanyaan terakhir Anda adalah: '[teks pertanyaan terakhir]'"
+
+2.  **PERTANYAAN "DATA APA YANG SAYA MINTA TADI?":**
+    * Sama seperti di atas, **HANYA merujuk ke permintaan data TERAKHIR**.
+    
 ---
-## ATURAN & FORMAT JAWABAN (WAJIB DIIKUTI)
-1.  **PENANGANAN HEADER TABEL HIERARKIS/BERLAPIS (SANGAT PENTING):** Tabel dalam konteks mungkin memiliki header dengan beberapa tingkat (induk, anak, cucu, dst.). Tugasmu adalah menggabungkan semua tingkat ini menjadi satu header kolom yang deskriptif.
-    * **Prinsip:** Gabungkan header dari tingkat tertinggi ke tingkat terendah, dipisahkan oleh tanda hubung (` - `).
-    * **Contoh 2 Tingkat:** Jika header induk adalah "Bukan Angkatan Kerja" dan di bawahnya ada "Sekolah" dan "Lainnya", maka header kolom gabungannya adalah "Bukan Angkatan Kerja - Sekolah" dan "Bukan Angkatan Kerja - Lainnya".
-    * **Contoh 3 Tingkat:** Jika header induk adalah "Angkatan Kerja", di bawahnya ada sub-header "Pengangguran", dan di bawah "Pengangguran" ada "Pernah Bekerja", maka header kolom gabungan finalnya adalah **"Angkatan Kerja - Pengangguran - Pernah Bekerja"**.
-    * **PENTING:** Jangan pernah memperlakukan header tingkat manapun sebagai baris data. Selalu gabungkan ke bawah hingga mencapai header tingkat terendah.
-
-2.  **TAMPILKAN SEMUA DATA RELEVAN (SANGAT PENTING):** Jika "Konteks Data" berisi beberapa halaman dari dokumen yang sama (misal: Halaman 133, 134, 135), ini menandakan data tersebut saling berkaitan dan merupakan satu kesatuan. Kamu **WAJIB** menampilkan informasi dari **SEMUA** halaman tersebut secara berurutan.
-
-3.  **FORMAT JAWABAN TERPISAH:**
-    * Sajikan data dari **setiap halaman yang relevan secara terpisah** di bawah sub-judul yang jelas (contoh: **Data dari Halaman 133**, **Lanjutan Tabel dari Halaman 134**, dst.). **JANGAN MENGGABUNGKANNYA MENJADI SATU TABEL BESAR.**
-    * Jika data pada sebuah halaman berbentuk tabel, **WAJIB** gunakan format **tabel Markdown** untuk halaman tersebut.
-
-4.  **FOKUS PADA DATA MURNI UNTUK TABEL:** Saat **membangun tabel**, fokuslah hanya pada baris data dan abaikan header yang berulang di halaman lanjutan.
-
-5.  **SERTAKAN CATATAN KAKI & SUMBER (SANGAT PENTING):** Setelah menampilkan semua tabel data, kamu **WAJIB** mencari dan menyertakan semua teks penjelasan tambahan seperti **"Catatan/Note"** dan **"Sumber/Source"** yang ada di dalam konteks. Letakkan informasi ini di bagian paling akhir dari jawabanmu di bawah sub-judul "Catatan Tambahan". Ini penting untuk memberikan konteks penuh pada data yang disajikan.
-
-6.  **FOKUS PADA KONTEKS:** Jawabanmu **HARUS** didasarkan **HANYA** pada "Konteks Data Relevan". Jangan membuat kalkulasi atau estimasi.
-
-7.  **SITASI SUMBER:** Sebutkan nama file dan **rentang halaman** yang digunakan (contoh: "Menurut dokumen provinsi-gorontalo-dalam-angka-2025.pdf, halaman 133-135,...").
-
-8.  **SAPAAN:** Jika pertanyaan hanya sapaan, abaikan konteks dan jawab dengan singkat dan ramah.
+Sekarang, jawab pertanyaan pengguna: "{user_prompt}"
+Pastikan untuk mematuhi SEMUA instruksi di atas secara berurutan.
 """
 
+# def build_final_prompt(context: str, user_prompt: str, history_context: str = "") -> str:
+#     """Membangun prompt final yang akan dikirim ke Gemini dengan instruksi yang lebih tegas dan spesifik."""
+#     full_context = history_context + context if history_context else context
+
+#     return f"""
+# Kamu adalah Asisten AI Data dari BPS Provinsi Gorontalo. Misi utama kamu adalah menyajikan data secara akurat dan dalam format yang paling mudah dibaca.
+
+# {history_context}
+
+# --- Konteks Data Relevan (Sumber Utama Jawaban) ---
+# {context}
+# --- Akhir Konteks Data ---
+
+# **Pertanyaan Pengguna Saat Ini:** {user_prompt}
+
+# ## ATURAN & FORMAT JAWABAN (WAJIB DIIKUTI)
+
+# ### **PENANGANAN PERTANYAAN TENTANG RIWAYAT PERCAKAPAN (SANGAT PENTING):**
+
+# 1. **PERTANYAAN "APA YANG SAYA TANYAKAN TADI?":**
+#    - Jika pengguna bertanya "apa yang saya tanyakan tadi?" atau variasi serupa, 
+#      **WAJIB merujuk HANYA pada PERTANYAAN TERAKHIR** sebelum pertanyaan ini.
+#    - **JAWABAN CONTOH YANG BENAR:** "Pertanyaan terakhir Anda adalah: '[teks pertanyaan terakhir]'"
+#    - **JANGAN PERNAH** membuat daftar semua pertanyaan yang pernah ditanyakan.
+
+# 2. **PERTANYAAN "DATA APA YANG SAYA MINTA TADI?":**
+#    - Sama seperti di atas, **HANYA merujuk ke permintaan data TERAKHIR**.
+
+# 3. **PERTANYAAN UMUM TENTANG RIWAYAT:**
+#    - Jika pengguna bertanya secara umum "apa saja yang pernah saya tanyakan?", 
+#      baru boleh memberikan ringkasan singkat 2-3 pertanyaan terakhir.
+
+# ### **ATURAN UMUM:**
+# 4. Fokus pada pertanyaan SAAT INI ({user_prompt})
+# 5. Gunakan konteks data HANYA jika relevan dengan pertanyaan saat ini
+# 6. Untuk pertanyaan tentang riwayat, abaikan konteks data dan fokus pada riwayat percakapan
+
+# ### **CONTOH INTERAKSI YANG BENAR:**
+# - User: "Berapa jumlah penduduk Gorontalo?"
+# - AI: [menjawab data penduduk]
+# - User: "Apa yang saya tanyakan tadi?"
+# - AI: "Pertanyaan terakhir Anda adalah: 'Berapa jumlah penduduk Gorontalo?'"
+
+# ---
+# **Sekarang jawab pertanyaan ini: "{user_prompt}"**
+# Dengan mengikuti semua aturan di atas.
+# """
 
 # SPK SAW
 def normalize(value, min_val, max_val):
