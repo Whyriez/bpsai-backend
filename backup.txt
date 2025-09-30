@@ -1,0 +1,434 @@
+chat.py
+import time
+import json
+import uuid
+from flask import Blueprint, request, Response, session, current_app, jsonify
+from app.models import db, BeritaBps, PromptLog, Feedback 
+from app.services import EmbeddingService, GeminiService
+from app.helpers import (
+    extract_years, detect_intent, extract_keywords, build_context,
+    build_final_prompt, build_ultimate_final_prompt, expand_query_with_synonyms, BPS_ACRONYM_DICTIONARY,
+    format_conversation_history
+)
+
+# Buat Blueprint untuk rute chat
+chat_bp = Blueprint('chat', __name__)
+
+embedding_service = EmbeddingService()
+gemini_service = GeminiService()
+
+def get_vector_relevant_news(user_prompt: str, limit: int = 10):
+    expanded_prompt = expand_query_with_synonyms(user_prompt, BPS_ACRONYM_DICTIONARY)
+    current_app.logger.info(f"Original prompt: '{user_prompt}', Expanded to: '{expanded_prompt}'")
+
+    prompt_embedding = embedding_service.generate(expanded_prompt)
+    if not prompt_embedding:
+        return []
+    results = BeritaBps.query.order_by(BeritaBps.embedding.cosine_distance(prompt_embedding)).limit(limit).all()
+    return results
+
+@chat_bp.route('/stream', methods=['POST'])
+def stream():
+    start_time = time.time()
+    data = request.json
+    user_prompt = data.get('prompt')
+    session_id = data.get('conversation_id')
+
+    if not user_prompt or not session_id:
+        return Response(json.dumps({'error': 'Prompt and conversation_id are required'}), status=400, mimetype='application/json')
+
+    recent_history_logs = PromptLog.query.filter(
+        PromptLog.session_id == session_id,
+        PromptLog.model_response.isnot(None),
+        ~PromptLog.model_response.ilike('data:%'),
+        ~PromptLog.model_response.ilike('error%')
+    ).order_by(PromptLog.id.desc()).limit(10).all() # Batasi query langsung di database
+
+    history_context = format_conversation_history(recent_history_logs)
+
+    log = PromptLog(
+        user_prompt=user_prompt,
+        session_id=session_id,
+        extracted_years=extract_years(user_prompt),
+        extracted_keywords=extract_keywords(user_prompt),
+        detected_intent=detect_intent(user_prompt)
+    )
+    db.session.add(log)
+    db.session.commit()
+    log_id = log.id
+
+    try:
+        relevant_news = get_vector_relevant_news(user_prompt, limit=15)
+        context = build_context(relevant_news, log.extracted_years)
+        final_prompt = build_final_prompt(context, user_prompt, history_context)
+
+        log.found_results = bool(relevant_news)
+        log.retrieved_news_count = len(relevant_news)
+        log.retrieved_news_ids = [news.id for news in relevant_news]
+        log.final_prompt = final_prompt
+        db.session.commit()
+
+        # **PERBAIKAN KUNCI 1:** Dapatkan objek aplikasi saat ini untuk diteruskan nanti
+        app = current_app._get_current_object()
+        model_response_buffer = ""
+        def generate():
+            nonlocal model_response_buffer
+            try:
+                for chunk in gemini_service.stream_generate_content(final_prompt):
+                    try:
+                        yield chunk
+                    except GeneratorExit:
+                        # Ini akan terpicu ketika klien menutup koneksi
+                        current_app.logger.info(f"Client disconnected for session {session_id}. Stopping stream.")
+                        # Hentikan perulangan (for loop) secara paksa
+                        break 
+            
+                    if chunk.strip().startswith('data: '):
+                        json_str = chunk.strip()[6:]
+                        if json_str and json_str != '[DONE]':
+                            try:
+                                data_chunk = json.loads(json_str)
+                                if 'text' in data_chunk:
+                                    model_response_buffer += data_chunk['text']
+                            except (json.JSONDecodeError, KeyError):
+                                continue
+            finally:
+                # **PERBAIKAN KUNCI 2:** Panggil fungsi update dengan objek 'app'
+                update_log_after_streaming(app, log_id, model_response_buffer, start_time)
+
+        return Response(generate(), mimetype='text/event-stream')
+
+    except Exception as e:
+        current_app.logger.error(f'Error processing chat stream: {e}')
+        log_to_update = db.session.get(PromptLog, log.id)
+        if log_to_update:
+            log_to_update.model_response = f"Error: {str(e)}"
+            log_to_update.processing_time_ms = int((time.time() - start_time) * 1000)
+            db.session.commit()
+        return Response(json.dumps({'error': 'Terjadi kesalahan internal.'}), status=500, mimetype='application/json')
+
+
+# **PERBAIKAN KUNCI 3:** Ubah signature fungsi untuk menerima objek 'app'
+def update_log_after_streaming(app, log_id, model_response, start_time):
+    """Function untuk update log setelah streaming selesai menggunakan konteks aplikasi yang diberikan."""
+    # **PERBAIKAN KUNCI 4:** Gunakan konteks dari 'app' yang diteruskan
+    with app.app_context():
+        try:
+            processing_time = int((time.time() - start_time) * 1000)
+            log_to_update = db.session.get(PromptLog, log_id)
+            if log_to_update:
+                log_to_update.model_response = model_response if model_response else "[No Content]"
+                log_to_update.processing_time_ms = processing_time
+                db.session.commit()
+                current_app.logger.info(f'Log updated successfully for log_id: {log_id}')
+            else:
+                current_app.logger.warning(f'Log with id {log_id} not found for updating.')
+        except Exception as e:
+            current_app.logger.error(f'Error updating log after streaming for log_id {log_id}: {e}')
+
+@chat_bp.route('/history/<conversation_id>', methods=['GET'])
+def get_history(conversation_id):
+    """Mengambil riwayat percakapan berdasarkan ID sesi/percakapan."""
+    if not conversation_id:
+        return jsonify({'error': 'Conversation ID is required'}), 400
+
+    try:
+        history_logs = PromptLog.query.filter_by(session_id=conversation_id).order_by(PromptLog.id.asc()).all()
+        formatted_history = []
+        for log in history_logs:
+            if log.user_prompt and log.model_response and not log.model_response.lower().startswith('error'):
+                feedback_record = Feedback.query.filter_by(prompt_log_id=log.id).first()
+                feedback_type = feedback_record.type if feedback_record else None
+
+                formatted_history.append({
+                    'prompt_log_id': log.id, 
+                    'user_prompt': log.user_prompt,
+                    'model_response': log.model_response,
+                    'has_feedback': feedback_type 
+                })
+        return jsonify(formatted_history)
+    except Exception as e:
+        current_app.logger.error(f'Error fetching history for {conversation_id}: {e}')
+        return jsonify({'error': 'Gagal mengambil riwayat percakapan.'}), 500
+
+helpers.py
+import re
+from app.models import BeritaBps, PromptLog
+import nltk
+from nltk.corpus import stopwords
+
+BPS_ACRONYM_DICTIONARY = {
+    'ntp': 'nilai tukar petani',
+    'ipm': 'indeks pembangunan manusia',
+    'ihk': 'indeks harga konsumen',
+    'pdb': 'produk domestik bruto',
+    'pph': 'perkembangan pariwisata dan hotel',
+    'tpt': 'tingkat pengangguran terbuka',
+    'ikg': 'indeks ketimpangan gender',
+}
+
+def expand_query_with_synonyms(prompt: str, dictionary: dict) -> str:
+    """Memperluas query dengan sinonim/akronim dari kamus."""
+    expanded_terms = []
+    # Gunakan regex untuk menemukan kata-kata utuh agar tidak salah cocok
+    words = re.findall(r'\b\w+\b', prompt.lower())
+    
+    for word in words:
+        if word in dictionary:
+            expanded_terms.append(dictionary[word])
+    
+    if expanded_terms:
+        # Gabungkan prompt asli dengan istilah yang diperluas
+        return f"{prompt} {' '.join(expanded_terms)}"
+    
+    # Jika tidak ada akronim yang ditemukan, kembalikan prompt asli
+    return prompt
+
+def extract_years(prompt: str) -> list:
+    """Mengekstrak tahun dari sebuah string prompt."""
+    years = set()
+    # Mencari rentang tahun, contoh: "2022 hingga 2024" atau "2022-2024"
+    range_match = re.search(r'\b(20\d{2})\s*(?:hingga|sampai|ke|dan|-)\s*(20\d{2})\b', prompt, re.IGNORECASE)
+    if range_match:
+        start_year, end_year = map(int, range_match.groups())
+        for year in range(start_year, end_year + 1):
+            years.add(year)
+    
+    # Mencari tahun individual
+    individual_matches = re.findall(r'\b(20\d{2})\b', prompt)
+    for year in individual_matches:
+        years.add(int(year))
+        
+    return sorted(list(years))
+
+def extract_keywords(prompt: str) -> list:
+    """Mengekstrak kata kunci dari prompt dengan menghapus stop words."""
+    # words = re.split(r'\s+', prompt)
+    standard_stop_words = set(stopwords.words('indonesian'))
+    
+    custom_stop_words  = [
+        'apa', 'siapa', 'kapan', 'dimana', 'mengapa', 'bagaimana', 'berapa',
+        'jelaskan', 'tampilkan', 'berikan', 'sebutkan', 'cari', 'carikan',
+        'analisis', 'buatkan', 'buat', 'analisa', 'di', 'ke', 'dari', 'pada',
+        'untuk', 'dengan', 'dan', 'atau', 'tapi', 'hingga', 'sampai',
+        'menurut', 'data', 'informasi', 'tahun', 'bulan', 'terbaru',
+        'provinsi', 'gorontalo', 'lebih', 'detail', 'rinci', 'lengkap',
+        'secara', 'dong', 'ya', 'tolong', 'tentang', 'mengenai', 'bentuk', 'butuh'
+    ]
+
+    all_stop_words = standard_stop_words.union(custom_stop_words)
+
+    words = re.findall(r'\b\w+\b', prompt.lower())
+    
+    keywords = []
+    for word in words:
+        # Cek apakah kata BUKAN stop word dan BUKAN angka
+        if word not in all_stop_words and not word.isdigit() and len(word) > 2:
+            keywords.append(word)
+            
+    return list(set(keywords))
+
+def detect_intent(prompt: str) -> str:
+    """Mendeteksi niat sederhana dari prompt (sapaan atau permintaan data)."""
+    cleaned_prompt = prompt.lower().strip()
+    greetings = ['halo', 'hai', 'selamat pagi', 'selamat siang', 'selamat malam', 'kamu siapa', 'siapa kamu', 'terima kasih']
+
+    for greeting in greetings:
+        if cleaned_prompt.startswith(greeting):
+            return 'sapaan'
+    
+    return 'data_request'
+
+def build_context(relevant_news: list[BeritaBps], requested_years: list = []) -> str:
+    """Membangun string konteks dari daftar berita yang relevan."""
+    if not relevant_news:
+        return "Tidak ditemukan berita yang relevan. Mohon informasikan kepada pengguna."
+
+    context = "--- KONTEKS DATA BERITA BPS GORONTALO ---\n\n"
+    
+    news_by_year = {}
+    for news in relevant_news:
+        year = news.tanggal_rilis.year
+        if year not in news_by_year:
+            news_by_year[year] = []
+        news_by_year[year].append(news)
+    
+    index = 0
+    for year in sorted(news_by_year.keys(), reverse=True):
+        context += f"### TAHUN {year} ###\n"
+        for news in news_by_year[year]:
+            context += f"## DATA {index}:\n"
+            context += f"**Judul:** {news.judul_berita}\n"
+            context += f"**Tanggal Rilis:** {news.tanggal_rilis.strftime('%Y-%m-%d')}\n"
+            context += f"**Ringkasan:** {news.ringkasan}\n"
+            context += f"**Link:** {news.link}\n\n"
+            index += 1
+            
+    if requested_years:
+        found_years = set(news_by_year.keys())
+        missing_years = sorted(list(set(requested_years) - found_years))
+        if missing_years:
+            context += f"CATATAN UNTUK AI: Data untuk tahun {', '.join(map(str, missing_years))} tidak ditemukan. Anda wajib memberitahu pengguna.\n\n"
+
+    context += "--- AKHIR DARI KONTEKS ---\n\n"
+    return context
+
+
+def format_conversation_history(history: list[PromptLog]) -> str:
+    """Mengubah daftar objek PromptLog menjadi string riwayat percakapan."""
+    if not history:
+        return ""
+    
+    # Format riwayat menjadi dialog yang lebih natural untuk LLM
+    formatted_history = "### RIWAYAT PERCAKAPAN SEBELUMNYA ###\n\n"
+    
+    for i, log in enumerate(history):
+        # Hanya sertakan interaksi yang berhasil dan bukan yang sedang diproses
+        if (log.user_prompt and log.model_response and 
+            not log.model_response.lower().strip().startswith('error') and
+            not log.model_response.lower().strip().startswith('data:')):
+            
+            # Tambahkan indikator urutan percakapan
+            formatted_history += f"**Interaksi {i + 1}:**\n"
+            formatted_history += f"User: {log.user_prompt}\n"
+            formatted_history += f"Asisten: {log.model_response}\n\n"
+    
+    if formatted_history != "### RIWAYAT PERCAKAPAN SEBELUMNYA ###\n\n":
+        formatted_history += "**CATATAN PENTING:** Jawablah pertanyaan user saat ini dengan mempertimbangkan konteks dari seluruh riwayat percakapan di atas. Jika user merujuk pada sesuatu yang sebelumnya dibicarakan, gunakan informasi dari riwayat tersebut.\n\n"
+    else:
+        formatted_history = ""
+        
+    return formatted_history
+
+
+def build_final_prompt(context: str, user_prompt: str, history_context: str = "") -> str:
+    """Membangun prompt final yang akan dikirim ke Gemini."""
+    
+    history_instruction = ""
+    if history_context:
+        history_instruction = """
+        **INSTRUKSI RIWAYAT PERCAKAPAN:** 
+        - Pertimbangkan KONTEKS dari seluruh riwayat percakapan di atas
+        - Jika user menggunakan kata seperti "sebelumnya", "tadi", "yang kamu sebutkan", itu merujuk pada percakapan dalam riwayat
+        - Jika user bertanya tentang periode waktu relatif ("tahun lalu", "sebelumnya"), hitung berdasarkan konteks riwayat
+        - Jawab dengan mempertimbangkan apa yang sudah dibicarakan sebelumnya
+        """
+
+    full_context = history_context + context if history_context else context
+
+    return f"""Kamu adalah Asisten Data BPS Provinsi Gorontalo. Ikuti aturan ini dengan sangat ketat:
+
+**ATURAN UTAMA:** Pertama, tentukan niat dari "Pertanyaan Pengguna".
+1.  Jika SAPAAN/PERCAKAPAN UMUM: Abaikan konteks data, jawab singkat dan ramah.
+2.  Jika PERMINTAAN DATA: Gunakan HANYA "Konteks Data" di bawah.
+
+{history_instruction}
+
+--- Konteks Data ---
+{full_context}
+--- Akhir dari Konteks Data ---
+
+**Pertanyaan Pengguna:** {user_prompt}
+
+**Instruksi Tambahan:**
+1.  **ANALISIS KONTEKS:** Jika user mengatakan "sebelumnya", "tahun lalu", dll., ANALISIS riwayat untuk memahami referensinya
+2.  **KEKONSISTENAN:** Pastikan jawaban konsisten dengan apa yang sudah dibicarakan sebelumnya
+3.  **DATA TIDAK DITEMUKAN:** Jika data tidak ada, sampaikan dengan jujur
+4.  **SUMBER:** Selalu sertakan link sumber
+5.  **FORMAT:** Gunakan Markdown yang rapi
+
+**Jawaban:**"""
+
+def build_improved_final_prompt(context: str, user_prompt: str, history_context: str = "") -> str:
+    """
+    Membangun prompt final yang dioptimalkan untuk mendorong output terstruktur (tabel)
+    dan memisahkan konteks dengan lebih jelas.
+    """
+    
+    # Bagian riwayat percakapan hanya akan muncul jika history_context ada
+    history_section = ""
+    if history_context:
+        history_section = f"""--- Riwayat Percakapan Sebelumnya ---
+{history_context}
+--- Akhir Riwayat ---"""
+
+    return f"""
+Kamu adalah Asisten AI Data dari BPS Provinsi Gorontalo. Misi utama kamu adalah menjawab pertanyaan pengguna berdasarkan data yang disediakan.
+
+{history_section}
+
+--- Konteks Data Relevan (Sumber Utama Jawaban) ---
+{context}
+--- Akhir Konteks Data ---
+
+**Pertanyaan Pengguna:** {user_prompt}
+
+---
+## ATURAN & FORMAT JAWABAN (WAJIB DIIKUTI)
+
+1.  **PRIORITAS UTAMA - BUAT TABEL:** Jika pertanyaan pengguna meminta data yang bisa ditabelkan (contoh: data per tahun, per wilayah, per kategori, atau perbandingan), **WAJIB** sajikan jawaban dalam format **tabel Markdown**. Gunakan header yang jelas. Jika tidak bisa ditabelkan, jawab dalam bentuk poin-poin atau paragraf.
+
+2.  **FOKUS PADA KONTEKS:** Jawabanmu **HARUS** didasarkan **HANYA** pada "Konteks Data Relevan" di atas. Jangan gunakan pengetahuan eksternal. Jika riwayat percakapan ada, gunakan itu untuk memahami referensi seperti "data tadi" atau "selain itu", tetapi sumber data utama tetap "Konteks Data Relevan".
+
+3.  **DATA TIDAK ADA:** Jika jawaban tidak ditemukan dalam "Konteks Data Relevan", katakan dengan jujur, "Maaf, saya tidak memiliki informasi mengenai hal tersebut dalam data yang saya miliki saat ini." dan tawarkan untuk membantu dengan topik lain yang ada di konteks.
+
+4.  **SUMBER:** Selalu sertakan link sumber
+
+5.  **SAPAAN:** Jika "Pertanyaan Pengguna" hanya sapaan atau percakapan umum (contoh: "halo", "terima kasih"), abaikan konteks dan jawab dengan singkat dan ramah.
+"""
+
+
+def build_ultimate_final_prompt(context: str, user_prompt: str, history_context: str = "") -> str:
+    """
+    Membangun prompt final yang SANGAT TEGAS untuk MENDORONG output tabel
+    dengan menggunakan instruksi spesifik dan contoh 'few-shot'.
+    """
+    
+    history_section = ""
+    if history_context:
+        history_section = f"""--- Riwayat Percakapan Sebelumnya ---
+{history_context}
+--- Akhir Riwayat ---"""
+
+    return f"""
+Kamu adalah Asisten AI Data dari BPS Provinsi Gorontalo. Misi utama kamu adalah menyajikan data secara akurat dan dalam format yang paling mudah dibaca.
+
+{history_section}
+
+--- Konteks Data Relevan (Sumber Utama Jawaban) ---
+{context}
+--- Akhir Konteks Data ---
+
+**Pertanyaan Pengguna:** {user_prompt}
+
+---
+## ATURAN & FORMAT JAWABAN (WAJIB DIIKUTI)
+
+**1. ATURAN #1 - FORMAT TABEL ADALAH PRIORITAS UTAMA!**
+   - **JIKA** pertanyaan pengguna meminta data berdasarkan **urutan waktu (tahunan, bulanan), perbandingan, atau daftar kategori** (contoh: data per wilayah, jenis kelamin, sektor ekonomi), kamu **WAJIB** menyajikan jawaban dalam format **tabel Markdown**.
+   - Aturan ini adalah prioritas tertinggi. Jangan gunakan format list jika data bisa ditabelkan.
+
+   - **CONTOH PERMINTAAN & JAWABAN IDEAL:**
+     - **Pertanyaan Pengguna:** "saya butuh data ntp 2023 hingga 2025"
+     - **JAWABAN YANG BENAR (Gunakan format ini):**
+       ```markdown
+       | Tahun | Nilai Tukar Petani (NTP) |
+       |-------|--------------------------|
+       | 2023  | [nilai dari konteks]     |
+       | 2024  | [nilai dari konteks]     |
+       | 2025  | [nilai dari konteks]     |
+       ```
+
+   - **FORMAT SALAH (JANGAN LAKUKAN INI):**
+     - * NTP Tahun 2023: [nilai]
+     - * NTP Tahun 2024: [nilai]
+     - * NTP Tahun 2025: [nilai]
+
+**2. FOKUS PADA KONTEKS:** Jawabanmu **HARUS** didasarkan **HANYA** pada "Konteks Data Relevan". Jangan gunakan pengetahuan eksternal.
+
+**3. DATA TIDAK ADA:** Jika jawaban tidak ditemukan, katakan dengan jujur, "Maaf, saya tidak memiliki informasi mengenai hal tersebut dalam data yang saya miliki saat ini."
+
+**4. SUMBER:** Selalu sertakan link sumber jika ada di dalam konteks.
+
+**5. SAPAAN:** Jika "Pertanyaan Pengguna" hanya sapaan (contoh: "halo", "terima kasih"), abaikan konteks dan jawab dengan singkat dan ramah.
+"""

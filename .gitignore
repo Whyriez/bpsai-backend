@@ -1,0 +1,28 @@
+# Abaikan virtual environments
+env/
+venv/
+
+# Abaikan __pycache__ dan file Python bytecode
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Abaikan file environment
+.env
+
+# Abaikan file konfigurasi editor (opsional)
+.vscode/
+
+# Abaikan semua isi dalam folder data/
+data/*
+
+# Kecualikan folder chunkpdf dan semua isinya
+!data/chunkpdf/
+!data/chunkpdf/**
+
+# Abaikan semua isi dalam folder app/static/
+app/static/*
+
+# Kecualikan folder pdf_images dan semua isinya
+!app/static/pdf_images/
+!app/static/pdf_images/**
