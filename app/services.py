@@ -2,8 +2,8 @@ import os
 import json
 import logging
 import requests
-import google.generativeai as genai
-from google.generativeai.types import generation_types
+from google import genai
+from google.genai import types
 import fitz
 import re
 import time
@@ -77,67 +77,120 @@ class EmbeddingService:
 
 class GeminiService:
     """
-    Kelas ini tidak berubah. Biarkan seperti yang sudah Anda miliki.
-    Mengelola beberapa API key dan melakukan rotasi otomatis.
+    Service sederhana untuk berkomunikasi dengan Gemini API.
+    Mengelola API key rotation dan streaming response.
     """
     def __init__(self):
         self.api_keys = [key.strip() for key in os.getenv("GEMINI_API_KEYS", "").split(',') if key.strip()]
         self.current_key_index = 0
-        self.model = None
+        self.client = None
+        
         if not self.api_keys:
             logging.error("GEMINI_API_KEYS environment variable is not set or is empty.")
             return
-        self._initialize_model()
+        
+        self._initialize_client()
 
-    def _initialize_model(self):
+    def _initialize_client(self):
+        """Inisialisasi client dengan API key saat ini"""
         if self.current_key_index >= len(self.api_keys):
-            self.model = None
+            self.client = None
             logging.warning("All Gemini API keys have exceeded their quota.")
             return
+        
         try:
             current_key = self.api_keys[self.current_key_index]
-            genai.configure(api_key=current_key)
-            self.model = genai.GenerativeModel('gemini-2.5-flash')
-            logging.info(f"Gemini Service initialized successfully with API key index: {self.current_key_index}")
+            self.client = genai.Client(api_key=current_key)
+            logging.info(f"Gemini Client initialized with API key index: {self.current_key_index}")
         except Exception as e:
-            self.model = None
-            logging.error(f"Failed to initialize Gemini Service with key index {self.current_key_index}: {e}")
+            self.client = None
+            logging.error(f"Failed to initialize Gemini Client with key index {self.current_key_index}: {e}")
 
     def _rotate_key(self):
-        logging.warning(f"API key at index {self.current_key_index} has exceeded its quota. Rotating to the next key.")
+        """Rotasi ke API key berikutnya"""
+        logging.warning(f"API key at index {self.current_key_index} exceeded quota. Rotating to next key.")
         self.current_key_index += 1
-        self._initialize_model()
+        self._initialize_client()
 
-    def stream_generate_content(self, final_prompt: str):
+    def stream_generate_content(self, prompt: str):
+        """
+        Stream generate content dari Gemini API.
+        Yields raw chunk objects dari Gemini - biarkan caller yang handle formatting.
+        
+        Raises:
+            StopIteration: Ketika streaming selesai
+            Exception: Untuk error lainnya (quota, safety, dll)
+        """
         while self.current_key_index < len(self.api_keys):
-            if not self.model:
-                error_message = json.dumps({'error': {'message': 'Semua API key telah mencapai batas kuota.'}})
-                yield f"data: {error_message}\n\n"
-                return
+            if not self.client:
+                raise Exception("All API keys have exceeded their quota")
+            
             try:
-                response = self.model.generate_content(final_prompt, stream=True)
+                # Disable thinking untuk RAG - context sudah lengkap dari database
+                from google.genai import types
+                
+                response = self.client.models.generate_content_stream(
+                    model='gemini-2.5-flash',
+                    contents=prompt,
+                    config=types.GenerateContentConfig(
+                        thinking_config=types.ThinkingConfig(thinking_budget=0)
+                    )
+                )
+                
                 for chunk in response:
-                    if chunk.text:
-                        sse_formatted_chunk = json.dumps({"text": chunk.text})
-                        yield f"data: {sse_formatted_chunk}\n\n"
-                yield "data: [DONE]\n\n"
-                return
-            except generation_types.StopCandidateException as e:
-                logging.error(f"Content generation stopped due to safety settings: {e}")
-                error_message = json.dumps({'error': {'message': 'Konten diblokir karena kebijakan keamanan.'}})
-                yield f"data: {error_message}\n\n"
-                return
+                    if hasattr(chunk, 'text') and chunk.text:
+                        yield chunk.text
+                
+                return  # Streaming selesai sukses
+                
             except Exception as e:
-                if "429" in str(e) and "quota" in str(e).lower():
+                error_str = str(e).lower()
+                
+                # Deteksi quota/429 error - rotate key dan retry
+                if "429" in str(e) or "quota" in error_str or "resource_exhausted" in error_str:
+                    logging.warning(f"Quota exceeded for key {self.current_key_index}: {e}")
+                    self._rotate_key()
+                    continue  # Retry dengan key baru
+                
+                # Deteksi safety filter
+                elif "safety" in error_str or "blocked" in error_str:
+                    raise Exception("Content blocked due to safety settings")
+                
+                # Error lain - propagate ke caller
+                else:
+                    logging.error(f"Gemini API error: {e}")
+                    raise
+        
+        # Semua keys habis
+        raise Exception("All API keys have exceeded their quota")
+
+    def generate_content(self, prompt: str) -> str | None:
+        """
+        Generate content tanpa streaming (synchronous).
+        Returns text atau None jika gagal.
+        """
+        while self.current_key_index < len(self.api_keys):
+            if not self.client:
+                return None
+            
+            try:
+                response = self.client.models.generate_content(
+                    model='gemini-2.5-flash',
+                    contents=prompt
+                )
+                return response.text
+                
+            except Exception as e:
+                error_str = str(e).lower()
+                
+                if "429" in str(e) or "quota" in error_str or "resource_exhausted" in error_str:
                     self._rotate_key()
                     continue
                 else:
-                    logging.error(f"An unexpected error occurred in SDK streaming: {e}")
-                    error_message = json.dumps({'error': {'message': 'Terjadi kesalahan tak terduga pada layanan AI.'}})
-                    yield f"data: {error_message}\n\n"
-                    return
-        final_error_message = json.dumps({'error': {'message': 'Semua API key telah mencapai batas kuota.'}})
-        yield f"data: {final_error_message}\n\n"
+                    logging.error(f"Error generating content: {e}")
+                    return None
+        
+        return None
 
 
 class RobustTableDetector:

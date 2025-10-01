@@ -135,29 +135,25 @@ def stream():
         log.final_prompt = final_prompt
         db.session.commit()
 
-        # Streaming response...
         app = current_app._get_current_object()
         model_response_buffer = ""
         
         def generate():
             nonlocal model_response_buffer
             try:
-                for chunk in gemini_service.stream_generate_content(final_prompt):
+                for text_chunk in gemini_service.stream_generate_content(final_prompt):
+                    model_response_buffer += text_chunk
+                    sse_chunk = json.dumps({"text": text_chunk})
                     try:
-                        yield chunk
+                        yield f"data: {sse_chunk}\n\n"
                     except GeneratorExit:
-                        current_app.logger.info(f"Client disconnected for session {session_id}. Stopping stream.")
-                        break 
-                    
-                    if chunk.strip().startswith('data: '):
-                        json_str = chunk.strip()[6:]
-                        if json_str and json_str != '[DONE]':
-                            try:
-                                data_chunk = json.loads(json_str)
-                                if 'text' in data_chunk:
-                                    model_response_buffer += data_chunk['text']
-                            except (json.JSONDecodeError, KeyError):
-                                continue
+                        current_app.logger.info(f"Client disconnected for session {session_id}")
+                        break
+                yield "data: [DONE]\n\n"
+            except Exception as e:
+                current_app.logger.error(f'Gemini streaming error: {e}')
+                error_msg = json.dumps({'error': {'message': str(e)}})
+                yield f"data: {error_msg}\n\n"
             finally:
                 update_log_after_streaming(app, log_id, model_response_buffer, start_time)
 
