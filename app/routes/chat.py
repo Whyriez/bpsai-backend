@@ -2,12 +2,9 @@ import time
 import json
 import uuid
 from flask import Blueprint, request, Response, session, current_app, jsonify
-# DIUBAH: Tambahkan DocumentChunk untuk query
 from app.models import db, BeritaBps, DocumentChunk, PromptLog, Feedback 
 from app.services import EmbeddingService, GeminiService
 from app.vector_db import get_collections
-
-# DIUBAH: build_context sekarang akan menangani data gabungan
 from app.helpers import (
     extract_years, detect_intent, extract_keywords, build_context,
     build_final_prompt, expand_query_with_synonyms, BPS_ACRONYM_DICTIONARY,
@@ -16,11 +13,14 @@ from app.helpers import (
 )
 from sqlalchemy.orm import aliased
 
-# Buat Blueprint untuk rute chat
 chat_bp = Blueprint('chat', __name__)
 
 embedding_service = EmbeddingService()
 gemini_service = GeminiService()
+
+def send_thinking_status(status, detail=""):
+    """Helper untuk mengirim status thinking ke client"""
+    return f"data: {json.dumps({'thinking': True, 'status': status, 'detail': detail})}\n\n"
 
 def get_combined_relevant_results(user_prompt: str, limit: int = 15):
     """
@@ -35,41 +35,35 @@ def get_combined_relevant_results(user_prompt: str, limit: int = 15):
 
     berita_collection, document_collection = get_collections()
 
-    # 1. Query ke collection BeritaBps
+    # Query ke collection BeritaBps
     berita_results = berita_collection.query(
         query_embeddings=[prompt_embedding],
         n_results=limit
     )
 
-    # 2. Query ke collection DocumentChunk
+    # Query ke collection DocumentChunk
     chunk_results = document_collection.query(
         query_embeddings=[prompt_embedding],
         n_results=limit
     )
 
-    # 3. Gabungkan dan proses hasil dari ChromaDB
+    # Gabungkan dan proses hasil dari ChromaDB
     combined_results = []
 
-    # Proses hasil berita
-    # ChromaDB mengembalikan dict, kita perlu mengambil ID dan distance
     if berita_results['ids'][0]:
         for i, item_id in enumerate(berita_results['ids'][0]):
             distance = berita_results['distances'][0][i]
-            # Ambil objek utuh dari PostgreSQL menggunakan ID yang didapat dari Chroma
             berita_obj = db.session.get(BeritaBps, int(item_id)) 
             if berita_obj:
                 combined_results.append((berita_obj, distance))
 
-    # Proses hasil chunk
     if chunk_results['ids'][0]:
         for i, item_id in enumerate(chunk_results['ids'][0]):
             distance = chunk_results['distances'][0][i]
-            # Ambil objek utuh dari PostgreSQL menggunakan ID
             chunk_obj = db.session.get(DocumentChunk, item_id)
             if chunk_obj:
                 combined_results.append((chunk_obj, distance))
 
-    # 4. Urutkan hasil gabungan berdasarkan distance
     combined_results.sort(key=lambda x: x[1])
 
     return combined_results[:limit]
@@ -86,7 +80,7 @@ def stream():
 
     db.session.expire_all()
 
-    # 1. SIMPAN PERTANYAAN BARU DULU
+    # Simpan pertanyaan baru
     log = PromptLog(
         user_prompt=user_prompt,
         session_id=session_id,
@@ -98,60 +92,82 @@ def stream():
     db.session.commit()
     log_id = log.id
 
-    # 2. BARU AMBIL RIWAYAT (sekarang sudah termasuk pertanyaan baru)
+    # Dapatkan app context SEBELUM generator dimulai
+    app = current_app._get_current_object()
     
-
     try:
-        recent_history_logs = PromptLog.query.filter(
-            PromptLog.session_id == session_id,
-            PromptLog.model_response.isnot(None),
-            ~PromptLog.model_response.ilike('data:%'),
-            ~PromptLog.model_response.ilike('error%')
-        ).order_by(PromptLog.id.desc()).limit(4).all()  # Gunakan asc untuk urutan kronologis
-
-        recent_history_logs.reverse() 
-
-        history_context = format_conversation_history(recent_history_logs)
-        # Lanjutkan dengan proses pencarian dan streaming...
-        relevant_items = get_combined_relevant_results(user_prompt, limit=15)
-        
-        items_to_rerank = [(item, dist) for item, dist in relevant_items]
-        relevant_items = rerank_with_dss(items_to_rerank)
-        
-        context = build_context(relevant_items, log.extracted_years)
-        final_prompt = build_final_prompt(context, user_prompt, history_context)
-
-        # Simpan retrieved_ids...
-        retrieved_ids = []
-        for item in relevant_items:
-            if isinstance(item, BeritaBps):
-                retrieved_ids.append({'type': 'berita', 'id': item.id})
-            elif isinstance(item, DocumentChunk):
-                retrieved_ids.append({'type': 'document_chunk', 'id': str(item.id)})
-
-        log.found_results = bool(relevant_items)
-        log.retrieved_news_count = len(relevant_items)
-        log.retrieved_news_ids = retrieved_ids
-        log.final_prompt = final_prompt
-        db.session.commit()
-
-        app = current_app._get_current_object()
-        model_response_buffer = ""
-        
         def generate():
-            nonlocal model_response_buffer
+            nonlocal log_id
+            model_response_buffer = ""
+            
             try:
+                # Semua operasi database harus dalam app context
+                with app.app_context():
+                    # Step 1: Analisis pertanyaan
+                    yield send_thinking_status("analyzing", "Menganalisis pertanyaan...")
+                    time.sleep(0.3)
+                    
+                    # Step 2: Ambil riwayat percakapan
+                    yield send_thinking_status("history", "Memuat riwayat percakapan...")
+                    recent_history_logs = PromptLog.query.filter(
+                        PromptLog.session_id == session_id,
+                        PromptLog.model_response.isnot(None),
+                        ~PromptLog.model_response.ilike('data:%'),
+                        ~PromptLog.model_response.ilike('error%')
+                    ).order_by(PromptLog.id.desc()).limit(4).all()
+                    recent_history_logs.reverse()
+                    history_context = format_conversation_history(recent_history_logs)
+                    
+                    # Step 3: Mencari data relevan
+                    yield send_thinking_status("searching", "Mencari data statistik relevan...")
+                    relevant_items = get_combined_relevant_results(user_prompt, limit=15)
+                    
+                    # Step 4: Ranking ulang hasil
+                    if relevant_items:
+                        yield send_thinking_status("ranking", f"Mengurutkan {len(relevant_items)} hasil pencarian...")
+                        items_to_rerank = [(item, dist) for item, dist in relevant_items]
+                        relevant_items = rerank_with_dss(items_to_rerank)
+                    
+                    # Step 5: Membangun konteks
+                    yield send_thinking_status("building", "Menyusun konteks jawaban...")
+                    context = build_context(relevant_items, log.extracted_years)
+                    final_prompt = build_final_prompt(context, user_prompt, history_context)
+
+                    # Simpan retrieved_ids
+                    retrieved_ids = []
+                    for item in relevant_items:
+                        if isinstance(item, BeritaBps):
+                            retrieved_ids.append({'type': 'berita', 'id': item.id})
+                        elif isinstance(item, DocumentChunk):
+                            retrieved_ids.append({'type': 'document_chunk', 'id': str(item.id)})
+
+                    log.found_results = bool(relevant_items)
+                    log.retrieved_news_count = len(relevant_items)
+                    log.retrieved_news_ids = retrieved_ids
+                    log.final_prompt = final_prompt
+                    db.session.commit()
+
+                # Step 6: Generate respons
+                yield send_thinking_status("generating", "Menyusun jawaban...")
+                time.sleep(0.3)
+                
+                # Setelah thinking selesai, kirim marker
+                yield f"data: {json.dumps({'thinking': False})}\n\n"
+                
+                # Mulai streaming respons AI
                 for text_chunk in gemini_service.stream_generate_content(final_prompt):
                     model_response_buffer += text_chunk
                     sse_chunk = json.dumps({"text": text_chunk})
                     try:
                         yield f"data: {sse_chunk}\n\n"
                     except GeneratorExit:
-                        current_app.logger.info(f"Client disconnected for session {session_id}")
+                        app.logger.info(f"Client disconnected for session {session_id}")
                         break
+                
                 yield "data: [DONE]\n\n"
+                
             except Exception as e:
-                current_app.logger.error(f'Gemini streaming error: {e}')
+                app.logger.error(f'Error in stream generation: {e}')
                 error_msg = json.dumps({'error': {'message': str(e)}})
                 yield f"data: {error_msg}\n\n"
             finally:
