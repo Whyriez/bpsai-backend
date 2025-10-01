@@ -3,7 +3,7 @@ from pgvector.sqlalchemy import Vector
 from sqlalchemy.orm import relationship
 from sqlalchemy import JSON, Enum, event, inspect, ForeignKey, Uuid, DateTime, Integer, Text, String
 from werkzeug.security import generate_password_hash, check_password_hash
-import datetime 
+from datetime import datetime
 import uuid
 import enum
 import pytz
