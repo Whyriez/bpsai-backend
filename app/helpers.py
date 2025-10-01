@@ -87,45 +87,53 @@ def build_context(relevant_items: list, requested_years: list = []) -> str:
     continuation_pattern = re.compile(r'(lanjutan tabel|tabel.*lanjutan|continued table)', re.IGNORECASE)
 
     # Buat salinan daftar awal untuk diiterasi
-    chunks_to_check = list(doc_chunks)
+    doc_ids_to_check = {chunk.document_id for chunk in doc_chunks}
 
-    for chunk in chunks_to_check:
-        # 1. Pencarian ke belakang (jika yang ditemukan adalah halaman lanjutan)
-        if continuation_pattern.search(chunk.chunk_content):
+    if doc_ids_to_check:
+        # Ambil SEMUA chunk dari dokumen yang relevan dalam SATU KALI query
+        all_related_chunks = DocumentChunk.query.filter(
+            DocumentChunk.document_id.in_(doc_ids_to_check)
+        ).all()
+
+        # Buat map untuk akses cepat: {document_id: {page_num: chunk_obj}}
+        chunks_by_doc_page = {}
+        for c in all_related_chunks:
+            if c.document_id not in chunks_by_doc_page:
+                chunks_by_doc_page[c.document_id] = {}
+            chunks_by_doc_page[c.document_id][c.page_number] = c
+
+        # Sekarang lakukan logika pencarian di memori, BUKAN di database
+        chunks_to_check = list(doc_chunks)
+        for chunk in chunks_to_check:
+            # 1. Pencarian ke belakang (in-memory)
+            if continuation_pattern.search(chunk.chunk_content):
+                current_page_num = chunk.page_number
+                while True:
+                    prev_page_num = current_page_num - 1
+                    if prev_page_num <= 0: break
+                    
+                    prev_chunk = chunks_by_doc_page.get(chunk.document_id, {}).get(prev_page_num)
+                    if prev_chunk and prev_chunk.id not in augmented_chunks_map:
+                        augmented_chunks_map[prev_chunk.id] = prev_chunk
+                        current_page_num -= 1
+                        if not continuation_pattern.search(prev_chunk.chunk_content):
+                            break
+                    else:
+                        break
+
+            # 2. Pencarian ke depan (in-memory)
             current_page_num = chunk.page_number
             while True:
-                prev_page_num = current_page_num - 1
-                if prev_page_num <= 0: break
+                next_page_num = current_page_num + 1
+                next_chunk = chunks_by_doc_page.get(chunk.document_id, {}).get(next_page_num)
+                if not next_chunk or not continuation_pattern.search(next_chunk.chunk_content):
+                    break
                 
-                prev_chunk = DocumentChunk.query.filter_by(document_id=chunk.document_id, page_number=prev_page_num).first()
-                if prev_chunk and prev_chunk.id not in augmented_chunks_map:
-                    augmented_chunks_map[prev_chunk.id] = prev_chunk
-                    print(f"INFO: Backward search found page {prev_page_num} for continued table.")
-                    current_page_num -= 1 # Lanjutkan pencarian ke belakang
-                    if not continuation_pattern.search(prev_chunk.chunk_content):
-                        break # Berhenti jika sudah menemukan awal tabel
-                else:
-                    break # Berhenti jika halaman sebelumnya tidak ada atau sudah diproses
+                if next_chunk.id not in augmented_chunks_map:
+                    augmented_chunks_map[next_chunk.id] = next_chunk
+                
+                current_page_num = next_page_num
 
-        # 2. Pencarian ke depan (iteratif untuk menemukan SEMUA halaman lanjutan)
-        current_page_num = chunk.page_number
-        while True:
-            next_page_num = current_page_num + 1
-            next_chunk = DocumentChunk.query.filter_by(document_id=chunk.document_id, page_number=next_page_num).first()
-
-            # Berhenti jika tidak ada halaman berikutnya ATAU halaman berikutnya bukan lanjutan
-            if not next_chunk or not continuation_pattern.search(next_chunk.chunk_content):
-                break
-            
-            # Jika itu adalah halaman lanjutan dan belum kita proses, tambahkan
-            if next_chunk.id not in augmented_chunks_map:
-                augmented_chunks_map[next_chunk.id] = next_chunk
-                print(f"INFO: Forward search found continued table on page {next_page_num}.")
-            
-            # PENTING: Lanjutkan loop dari halaman yang baru ditemukan
-            current_page_num = next_page_num
-
-    # Konversi kembali dari map ke list
     doc_chunks = list(augmented_chunks_map.values())
     # --- AKHIR DARI LOGIKA BARU ---
 

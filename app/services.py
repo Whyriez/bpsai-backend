@@ -11,12 +11,12 @@ import hashlib
 from typing import List, Dict, Any
 from .models import db, PdfDocument, DocumentChunk
 from flask import current_app
+from cachetools import TTLCache
 
 logging.basicConfig(level=logging.INFO)
 
 class EmbeddingService:
     def __init__(self):
-        # --- Bagian ini tidak perlu diubah ---
         api_keys_str = os.getenv('GEMINI_API_KEYS', "")
         api_keys_list = [key.strip() for key in api_keys_str.split(',') if key.strip()]
 
@@ -27,44 +27,51 @@ class EmbeddingService:
             self.api_key = api_keys_list[0]
         
         self.url = f"https://generativelanguage.googleapis.com/v1beta/models/text-embedding-004:embedContent?key={self.api_key}"
-        # --- Akhir bagian yang tidak berubah ---
+  
+        self.cache = TTLCache(maxsize=1000, ttl=3600)
+        # =========================================================
 
     def generate(self, text: str) -> list | None:
+        if text in self.cache:
+            logging.info(f"Embedding cache hit for text: '{text[:50]}...'")
+            return self.cache[text]
+
         if not text or not self.api_key:
             if not self.api_key:
                 logging.error("Embedding generation failed: API key is None.")
             return None
         
         # --- AWAL DARI LOGIKA RETRY ---
-        retries = 3  # Jumlah maksimum percobaan ulang
-        backoff_factor = 2  # Waktu tunggu akan menjadi 2s, 4s, 8s
+        retries = 3
+        backoff_factor = 2
         
         for i in range(retries):
             try:
                 response = requests.post(
                     self.url,
                     json={'model': 'models/text-embedding-004', 'content': {'parts': [{'text': text}]}},
-                    timeout=20 # Tambahkan timeout agar tidak menunggu selamanya
+                    timeout=20
                 )
-                # Lemparkan error untuk status 5xx agar bisa ditangkap oleh blok except
                 response.raise_for_status() 
                 result = response.json()
-                return result.get('embedding', {}).get('values')
+                embedding_values = result.get('embedding', {}).get('values')
+
+                # Logika untuk menyimpan ke cache
+                if embedding_values:
+                    self.cache[text] = embedding_values
+                
+                return embedding_values
                 
             except requests.exceptions.RequestException as e:
-                # Cek apakah errornya adalah server error (5xx) yang layak untuk dicoba lagi
                 if isinstance(e, requests.exceptions.HTTPError) and 500 <= e.response.status_code < 600:
                     wait_time = backoff_factor ** (i + 1)
                     logging.warning(f"Gemini API error ({e.response.status_code}). Mencoba lagi dalam {wait_time} detik...")
                     time.sleep(wait_time)
-                    # Lanjutkan ke iterasi retry berikutnya
                     continue 
                 else:
-                    # Untuk error lain (koneksi, error 4xx client, dll.), langsung hentikan percobaan
                     logging.error(f"Gemini Embedding API Error (tidak bisa di-retry): {e}")
                     return None 
         
-        # Jika semua percobaan gagal, catat error terakhir dan kembalikan None
         logging.error(f"Gagal mengambil embedding dari Gemini API setelah {retries} kali percobaan.")
         return None
 

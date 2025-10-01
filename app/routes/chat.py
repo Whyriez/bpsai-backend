@@ -5,6 +5,8 @@ from flask import Blueprint, request, Response, session, current_app, jsonify
 # DIUBAH: Tambahkan DocumentChunk untuk query
 from app.models import db, BeritaBps, DocumentChunk, PromptLog, Feedback 
 from app.services import EmbeddingService, GeminiService
+from app.vector_db import get_collections
+
 # DIUBAH: build_context sekarang akan menangani data gabungan
 from app.helpers import (
     extract_years, detect_intent, extract_keywords, build_context,
@@ -22,8 +24,7 @@ gemini_service = GeminiService()
 
 def get_combined_relevant_results(user_prompt: str, limit: int = 15):
     """
-    Melakukan vector search pada BeritaBps dan DocumentChunk, 
-    menggabungkan hasilnya, dan mengurutkan berdasarkan relevansi.
+    Melakukan vector search menggunakan ChromaDB, menggabungkan hasilnya.
     """
     expanded_prompt = expand_query_with_synonyms(user_prompt, BPS_ACRONYM_DICTIONARY)
     current_app.logger.info(f"Original prompt: '{user_prompt}', Expanded to: '{expanded_prompt}'")
@@ -32,27 +33,45 @@ def get_combined_relevant_results(user_prompt: str, limit: int = 15):
     if not prompt_embedding:
         return []
 
-    # 1. Query ke tabel BeritaBps
-    berita_results = db.session.query(
-        BeritaBps,
-        BeritaBps.embedding.cosine_distance(prompt_embedding).label('distance')
-    ).order_by('distance').limit(limit).all()
+    berita_collection, document_collection = get_collections()
 
-    # 2. Query ke tabel DocumentChunk
-    chunk_results = db.session.query(
-        DocumentChunk,
-        DocumentChunk.embedding.cosine_distance(prompt_embedding).label('distance')
-    ).order_by('distance').limit(limit).all()
+    # 1. Query ke collection BeritaBps
+    berita_results = berita_collection.query(
+        query_embeddings=[prompt_embedding],
+        n_results=limit
+    )
 
-    # 3. Gabungkan hasil dari kedua query
-    combined_results = berita_results + chunk_results
+    # 2. Query ke collection DocumentChunk
+    chunk_results = document_collection.query(
+        query_embeddings=[prompt_embedding],
+        n_results=limit
+    )
 
-    # 4. Urutkan hasil gabungan berdasarkan 'distance' (semakin kecil semakin relevan)
-    combined_results.sort(key=lambda x: x.distance)
+    # 3. Gabungkan dan proses hasil dari ChromaDB
+    combined_results = []
 
-    # 5. Ambil objeknya saja dan batasi sesuai limit
-    # final_results = [item for item, distance in combined_results[:limit]]
-    
+    # Proses hasil berita
+    # ChromaDB mengembalikan dict, kita perlu mengambil ID dan distance
+    if berita_results['ids'][0]:
+        for i, item_id in enumerate(berita_results['ids'][0]):
+            distance = berita_results['distances'][0][i]
+            # Ambil objek utuh dari PostgreSQL menggunakan ID yang didapat dari Chroma
+            berita_obj = db.session.get(BeritaBps, int(item_id)) 
+            if berita_obj:
+                combined_results.append((berita_obj, distance))
+
+    # Proses hasil chunk
+    if chunk_results['ids'][0]:
+        for i, item_id in enumerate(chunk_results['ids'][0]):
+            distance = chunk_results['distances'][0][i]
+            # Ambil objek utuh dari PostgreSQL menggunakan ID
+            chunk_obj = db.session.get(DocumentChunk, item_id)
+            if chunk_obj:
+                combined_results.append((chunk_obj, distance))
+
+    # 4. Urutkan hasil gabungan berdasarkan distance
+    combined_results.sort(key=lambda x: x[1])
+
     return combined_results[:limit]
 
 @chat_bp.route('/stream', methods=['POST'])
