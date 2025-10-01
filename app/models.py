@@ -3,9 +3,10 @@ from pgvector.sqlalchemy import Vector
 from sqlalchemy.orm import relationship
 from sqlalchemy import JSON, Enum, event, inspect, ForeignKey, Uuid, DateTime, Integer, Text, String
 from werkzeug.security import generate_password_hash, check_password_hash
-import datetime
+import datetime 
 import uuid
 import enum
+import pytz
 # from app.services import EmbeddingService
 
 db = SQLAlchemy()
@@ -48,8 +49,8 @@ class User(db.Model):
     email = db.Column(db.String(120), unique=True, nullable=False, index=True)
     password_hash = db.Column(db.String(255), nullable=False)
     role = db.Column(db.String(80), nullable=False, default='user')
-    created_at = db.Column(db.DateTime, default=datetime.datetime.utcnow)
-    updated_at = db.Column(db.DateTime, default=datetime.datetime.utcnow, onupdate=datetime.datetime.utcnow)
+    created_at = db.Column(db.DateTime(timezone=True), default=lambda: datetime.now(pytz.utc))
+    updated_at = db.Column(db.DateTime(timezone=True), default=lambda: datetime.now(pytz.utc), onupdate=lambda: datetime.now(pytz.utc))
 
     def set_password(self, password):
         """Membuat hash dari password dan menyimpannya."""
@@ -71,8 +72,8 @@ class BeritaBps(db.Model):
     link = db.Column(db.Text, nullable=False)
     tags = db.Column(JSON, nullable=True)
     embedding = db.Column(Vector(768), nullable=True)
-    created_at = db.Column(db.DateTime, default=datetime.datetime.utcnow)
-    updated_at = db.Column(db.DateTime, default=datetime.datetime.utcnow, onupdate=datetime.datetime.utcnow)
+    created_at = db.Column(db.DateTime(timezone=True), default=lambda: datetime.now(pytz.utc))
+    updated_at = db.Column(db.DateTime(timezone=True), default=lambda: datetime.now(pytz.utc), onupdate=lambda: datetime.now(pytz.utc))
 
 def generate_embedding_listener(mapper, connection, target):
     """
@@ -123,8 +124,8 @@ class PromptLog(db.Model):
     retrieved_news_ids = db.Column(JSON, nullable=True)
     session_id = db.Column(db.String(255), nullable=True, index=True)
     processing_time_ms = db.Column(db.Integer, nullable=True)
-    created_at = db.Column(db.DateTime, default=datetime.datetime.utcnow, index=True)
-    updated_at = db.Column(db.DateTime, default=datetime.datetime.utcnow, onupdate=datetime.datetime.utcnow)
+    created_at = db.Column(db.DateTime(timezone=True), default=lambda: datetime.now(pytz.utc), index=True)
+    updated_at = db.Column(db.DateTime(timezone=True), default=lambda: datetime.now(pytz.utc), onupdate=lambda: datetime.now(pytz.utc))
 
     # Relasi ke feedback
     feedbacks = db.relationship('Feedback', backref='prompt_log', lazy=True, cascade="all, delete-orphan")
@@ -137,8 +138,8 @@ class Feedback(db.Model):
     type = db.Column(Enum('positive', 'negative', name='feedback_type_enum'), nullable=False)
     comment = db.Column(db.Text, nullable=True)
     session_id = db.Column(db.String(255), nullable=True, index=True)
-    created_at = db.Column(db.DateTime, default=datetime.datetime.utcnow)
-    updated_at = db.Column(db.DateTime, default=datetime.datetime.utcnow, onupdate=datetime.datetime.utcnow)
+    created_at = db.Column(db.DateTime(timezone=True), default=lambda: datetime.now(pytz.utc))
+    updated_at = db.Column(db.DateTime(timezone=True), default=lambda: datetime.now(pytz.utc), onupdate=lambda: datetime.now(pytz.utc))
 
 class PdfDocument(db.Model):
     """
@@ -153,8 +154,8 @@ class PdfDocument(db.Model):
     total_pages = db.Column(Integer, nullable=True)
     document_hash = db.Column(String(64), nullable=True, unique=True)
     doc_metadata = db.Column(JSON, nullable=True) # Metadata tambahan (misal: penulis, tanggal publikasi)
-    created_at = db.Column(DateTime, default=datetime.datetime.utcnow)
-    updated_at = db.Column(DateTime, default=datetime.datetime.utcnow, onupdate=datetime.datetime.utcnow)
+    created_at = db.Column(db.DateTime(timezone=True), default=lambda: datetime.now(pytz.utc))
+    updated_at = db.Column(db.DateTime(timezone=True), default=lambda: datetime.now(pytz.utc), onupdate=lambda: datetime.now(pytz.utc))
 
     chunks = relationship('DocumentChunk', back_populates='document', lazy='dynamic', cascade="all, delete-orphan")
 
@@ -176,8 +177,8 @@ class DocumentChunk(db.Model):
     reconstructed_content = db.Column(Text, nullable=True) 
     embedding = db.Column(Vector(768), nullable=True)
     chunk_metadata = db.Column(JSON, nullable=True) # Metadata spesifik chunk (misal: ada tabel di halaman ini)
-    created_at = db.Column(DateTime, default=datetime.datetime.utcnow)
-    updated_at = db.Column(DateTime, default=datetime.datetime.utcnow, onupdate=datetime.datetime.utcnow)
+    created_at = db.Column(db.DateTime(timezone=True), default=lambda: datetime.now(pytz.utc))
+    updated_at = db.Column(db.DateTime(timezone=True), default=lambda: datetime.now(pytz.utc), onupdate=lambda: datetime.now(pytz.utc))
 
     document = relationship('PdfDocument', back_populates='chunks')
 

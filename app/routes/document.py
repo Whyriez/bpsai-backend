@@ -204,7 +204,7 @@ def reconstruct_chunk_content(chunk_id):
         chunk = db.get_or_404(DocumentChunk, chunk_id)
         
         gemini_service = GeminiService()
-        if not gemini_service.model:
+        if not gemini_service.client:
             return jsonify({"error": "Layanan AI tidak terkonfigurasi atau kuota habis."}), 503
 
         # --- PROMPT FINAL DENGAN ATURAN SPANNING HEADER ---
@@ -238,9 +238,12 @@ def reconstruct_chunk_content(chunk_id):
         --- AKHIR TEKS MENTAH ---
         """
         
-        response = gemini_service.model.generate_content(prompt)
+        reconstructed_text = gemini_service.generate_content(prompt)
 
-        return jsonify({"reconstructed_text": response.text}), 200
+        if reconstructed_text is None:
+            return jsonify({"error": "Gagal mendapatkan respons dari layanan AI."}), 500
+
+        return jsonify({"reconstructed_text": reconstructed_text}), 200
 
     except Exception as e:
         current_app.logger.error(f"Error reconstructing chunk {chunk_id}: {e}")
@@ -512,20 +515,16 @@ def run_batch_reconstruction(app, job_name, document_id):
                     --- AKHIR TEKS MENTAH ---
                     """
                     
-                    if not gemini_service.model:
+                    if not gemini_service.client:
                         raise Exception("Layanan AI tidak tersedia atau semua kuota API habis.")
 
-                    response = gemini_service.model.generate_content(prompt)
+                    reconstructed_text = gemini_service.generate_content(prompt)
                     
-                    # PERBAIKAN BAGIAN 1: Simpan hasil rekonstruksi per chunk
-                    if response.text:
-                        chunk.reconstructed_content = response.text
-                        chunk.chunk_content = response.text # Update konten utama agar embedding diperbarui
-                    db.session.commit() # Commit HANYA untuk object chunk ini
+                    if reconstructed_text:
+                        chunk.reconstructed_content = reconstructed_text
+                        chunk.chunk_content = reconstructed_text # Update konten utama agar embedding diperbarui
+                    db.session.commit()
 
-                    # PERBAIKAN BAGIAN 2: Update progress tanpa menimpa status
-                    # Dengan query UPDATE langsung, kita hanya menyentuh kolom processed_items
-                    # Ini adalah cara paling aman untuk menghindari race condition
                     current_processed_items = job.processed_items + 1
                     BatchJob.query.filter_by(id=job.id).update({'processed_items': current_processed_items})
                     db.session.commit() # Commit HANYA untuk update progress

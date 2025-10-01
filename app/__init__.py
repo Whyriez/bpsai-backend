@@ -7,6 +7,8 @@ from .commands import register_commands
 from flask_jwt_extended import JWTManager
 from datetime import timedelta
 import nltk
+import pytz
+from datetime import datetime
 from .vector_db import register_db_listeners
 
 
@@ -55,6 +57,7 @@ def create_app():
     register_commands(app)
 
     register_db_listeners()
+
     with app.app_context():
         # Buat semua tabel database jika belum ada
         db.create_all()
