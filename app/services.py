@@ -13,6 +13,7 @@ from typing import List, Dict, Any
 from .models import db, PdfDocument, DocumentChunk
 from flask import current_app
 from cachetools import TTLCache
+import shutil
 
 logging.basicConfig(level=logging.INFO)
 
@@ -317,6 +318,7 @@ class RobustTableDetector:
 
 
 def process_and_save_pdf(pdf_path: str) -> Dict[str, Any]:
+    base_filename = os.path.splitext(os.path.basename(pdf_path))[0]
     try:
         file_hash = hashlib.sha256(open(pdf_path, "rb").read()).hexdigest()
         existing_doc = PdfDocument.query.filter_by(document_hash=file_hash).first()
@@ -357,4 +359,15 @@ def process_and_save_pdf(pdf_path: str) -> Dict[str, Any]:
     except Exception as e:
         db.session.rollback()
         logging.error(f"Error processing {pdf_path}: {e}")
+
+        image_dir = current_app.config.get('PDF_IMAGES_DIRECTORY')
+        if image_dir:
+            doc_image_folder = os.path.join(image_dir, base_filename)
+            if os.path.isdir(doc_image_folder):
+                try:
+                    shutil.rmtree(doc_image_folder)
+                    logging.info(f"Rollback: Cleaned up image folder {doc_image_folder} due to processing error.")
+                except Exception as cleanup_error:
+                    logging.error(f"Error during image cleanup for {base_filename}: {cleanup_error}")
+
         return {"status": "error", "filename": os.path.basename(pdf_path), "reason": str(e)}

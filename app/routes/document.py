@@ -7,6 +7,7 @@ from datetime import datetime
 from sqlalchemy import cast, String
 import threading
 import time
+import shutil
 
 document_bp = Blueprint('document', __name__, url_prefix='/api/documents')
 
@@ -100,17 +101,32 @@ def update_document_details(document_id):
 # @jwt_required() # Sangat disarankan untuk mengaktifkan ini untuk keamanan
 def delete_document(document_id):
     """
-    Menghapus sebuah dokumen dan semua chunk yang terkait dengannya.
+    Menghapus sebuah dokumen, semua chunk, dan folder gambar terkait.
     """
     try:
         doc = db.get_or_404(PdfDocument, document_id)
     
         filename = doc.filename
+        
+        # --- LOGIKA BARU UNTUK MENGHAPUS FOLDER GAMBAR ---
+        base_filename = os.path.splitext(filename)[0]
+        image_dir = current_app.config.get('PDF_IMAGES_DIRECTORY')
+
+        if image_dir:
+            doc_image_folder = os.path.join(image_dir, base_filename)
+            if os.path.isdir(doc_image_folder):
+                try:
+                    shutil.rmtree(doc_image_folder)
+                    current_app.logger.info(f"Successfully deleted image folder: {doc_image_folder}")
+                except Exception as e:
+                    # Log error jika gagal hapus folder, tapi proses tetap lanjut
+                    current_app.logger.error(f"Failed to delete image folder {doc_image_folder}: {e}")
+        # --- AKHIR LOGIKA BARU ---
+
         db.session.delete(doc)
         db.session.commit()
         
         return jsonify({"message": f"Dokumen '{filename}' dan semua data terkait berhasil dihapus."}), 200
-
     except Exception as e:
         db.session.rollback()
         current_app.logger.error(f"Error deleting document {document_id}: {e}")
@@ -144,7 +160,7 @@ def get_document_table_pages(document_id):
         start = (page - 1) * per_page
         end = start + per_page
         paginated_chunks = all_table_chunks[start:end]
-        total_pages = (total_items + per_page - 1)
+        total_pages = (total_items + per_page - 1) // per_page if total_items > 0 else total_pages
 
         results = {
             "id": doc.id,
