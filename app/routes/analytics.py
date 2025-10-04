@@ -80,9 +80,9 @@ def get_all_analytics():
     avg_response_time = response_time_query.with_entities(func.avg(PromptLog.processing_time_ms)).scalar() or 0
 
     if total_logs_with_time > 0:
-        fast_count = response_time_query.filter(PromptLog.processing_time_ms < 100).count()
-        medium_count = response_time_query.filter(PromptLog.processing_time_ms.between(100, 500)).count()
-        slow_count = response_time_query.filter(PromptLog.processing_time_ms > 500).count()
+        fast_count = response_time_query.filter(PromptLog.processing_time_ms < 2000).count()
+        medium_count = response_time_query.filter(PromptLog.processing_time_ms.between(2000, 5000)).count()
+        slow_count = response_time_query.filter(PromptLog.processing_time_ms > 5000).count()
         response_time_distribution = {
             'fast': round((fast_count / total_logs_with_time) * 100),
             'medium': round((medium_count / total_logs_with_time) * 100),

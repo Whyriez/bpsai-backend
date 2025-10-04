@@ -293,40 +293,53 @@ def run_pdf_chunking(app, job_name):
             app.logger.warning(f"PDF Chunking worker for {job_name} started but job is not in RUNNING state.")
             return
 
-        items_processed_in_this_run = 0
         stop_signal_received = False
         
         try:
             pdf_directory = app.config.get('PDF_CHUNK_DIRECTORY')
             pdf_files = [f for f in os.listdir(pdf_directory) if f.lower().endswith('.pdf')]
-            
-            for filename in pdf_files:
+            total_files = len(pdf_files)
+
+            # PERBAIKAN 1: Gunakan enumerate untuk penghitungan yang akurat
+            for i, filename in enumerate(pdf_files, 1):
                 current_status = db.session.query(BatchJob.status).filter_by(id=job.id).scalar()
                 if current_status == JobStatus.STOPPING:
                     app.logger.info(f"Stop signal for {job_name} detected. Finalizing...")
                     stop_signal_received = True
                     break
+                
+                # FITUR BARU: Update pesan status sebelum memproses
+                update_payload = {
+                    'last_error': f"Memproses file {i}/{total_files}: {filename}"
+                }
+                BatchJob.query.filter_by(id=job.id).update(update_payload)
+                db.session.commit()
 
                 pdf_path = os.path.join(pdf_directory, filename)
                 try:
                     process_and_save_pdf(pdf_path)
-                    items_processed_in_this_run += 1
-                    app.logger.info(f"Successfully chunked '{filename}'. Progress: {items_processed_in_this_run}/{len(pdf_files)}")
+                    
+                    # PERBAIKAN 2: Update progress dengan `i`, bukan akumulasi manual
+                    BatchJob.query.filter_by(id=job.id).update({'processed_items': i})
+                    db.session.commit()
+
+                    app.logger.info(f"Successfully chunked '{filename}'. Progress: {i}/{total_files}")
+
                 except Exception as e:
                     app.logger.error(f"Failed to process '{filename}': {e}")
                 
-                # Update progress di DB secara aman
-                BatchJob.query.filter_by(id=job.id).update({'processed_items': job.processed_items + items_processed_in_this_run})
-                db.session.commit()
                 time.sleep(1) # Jeda singkat
 
             db.session.refresh(job)
-            job.processed_items = job.processed_items # Refresh nilai
-            
+            final_update = {}
             if stop_signal_received:
-                job.status = JobStatus.IDLE
+                final_update['status'] = JobStatus.IDLE
+                final_update['last_error'] = "Proses dihentikan oleh pengguna."
             else:
-                job.status = JobStatus.COMPLETED
+                final_update['status'] = JobStatus.COMPLETED
+                final_update['last_error'] = f"Selesai: {job.processed_items} file berhasil diproses."
+            
+            BatchJob.query.filter_by(id=job.id).update(final_update)
             db.session.commit()
 
         except Exception as e:
@@ -335,7 +348,7 @@ def run_pdf_chunking(app, job_name):
             job = BatchJob.query.filter_by(job_name=job_name).first()
             if job:
                 job.status = JobStatus.FAILED
-                job.last_error = str(e)
+                job.last_error = f"Error kritis: {str(e)}"
                 db.session.commit()
 
 # --- ENDPOINT API BARU UNTUK KONTROL CHUNKING JOB ---
@@ -364,7 +377,7 @@ def start_chunking_job():
     job.processed_items = 0
     job.started_at = datetime.utcnow()
     job.completed_at = None
-    job.last_error = None
+    job.last_error = "Memulai proses..." # Pesan awal
     db.session.commit()
 
     thread = threading.Thread(target=run_pdf_chunking, args=(current_app._get_current_object(), job_name))
@@ -382,6 +395,7 @@ def stop_chunking_job():
         return jsonify({"error": "Tidak ada proses chunking yang sedang berjalan untuk dihentikan."}), 404
     
     job.status = JobStatus.STOPPING
+    job.last_error = "Mengirim sinyal berhenti..." # Pesan saat menghentikan
     db.session.commit()
     return jsonify({"message": "Sinyal berhenti telah dikirim ke proses chunking."}), 200
 
@@ -393,13 +407,16 @@ def get_chunking_job_status():
     if not job:
         return jsonify({
             "status": JobStatus.IDLE.value, "progress": 0, "total_items": 0,
-            "processed_items": 0, "last_error": None
+            "processed_items": 0, "last_error": "Belum ada proses yang berjalan."
         }), 200
     
+    # PERBAIKAN 3: Ubah nama field 'last_error' menjadi 'message' untuk kejelasan di frontend
     return jsonify({
-        "status": job.status.value, "progress": job.get_progress(),
-        "total_items": job.total_items, "processed_items": job.processed_items,
-        "last_error": job.last_error
+        "status": job.status.value, 
+        "progress": job.get_progress(),
+        "total_items": job.total_items, 
+        "processed_items": job.processed_items,
+        "message": job.last_error # Mengirim pesan status ke frontend
     }), 200
 
 @document_bp.route('/process-folder', methods=['POST'])

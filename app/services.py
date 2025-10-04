@@ -1,5 +1,6 @@
 import os
 import json
+import hashlib
 import logging
 import requests
 from google import genai
