@@ -47,7 +47,7 @@ def extract_keywords(prompt: str) -> list:
     """Mengekstrak kata kunci dari prompt dengan menghapus stop words."""
     standard_stop_words = set(stopwords.words('indonesian'))
     custom_stop_words  = [
-        'apa', 'siapa', 'kapan', 'dimana', 'mengapa', 'bagaimana', 'berapa',
+        'apa', 'siapa', 'kapan', 'Hallo', 'kenapa', 'dimana', 'kota', 'kabupaten', 'mengapa', 'bagaimana', 'berapa',
         'jelaskan', 'tampilkan', 'berikan', 'sebutkan', 'cari', 'carikan',
         'analisis', 'buatkan', 'buat', 'analisa', 'di', 'ke', 'dari', 'pada',
         'untuk', 'dengan', 'dan', 'atau', 'tapi', 'hingga', 'sampai',
