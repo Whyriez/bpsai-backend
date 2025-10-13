@@ -1,15 +1,22 @@
 import os
-from flask import Blueprint, jsonify, current_app, request 
+from flask import Blueprint, jsonify, current_app, request, send_from_directory
 from flask_jwt_extended import jwt_required, get_jwt
 from ..services import process_and_save_pdf, GeminiService
 from ..models import db, PdfDocument, DocumentChunk, BatchJob, JobStatus 
-from datetime import datetime
+from datetime import datetime, timedelta
 from sqlalchemy import cast, String
 import threading
 import time
+from pathlib import Path
 import shutil
+from urllib.parse import unquote
+import traceback
+from ..job_utils import check_job_should_stop, cleanup_job_state, update_job_heartbeat
 
 document_bp = Blueprint('document', __name__, url_prefix='/api/documents')
+
+JOB_TIMEOUT_MINUTES = 30
+HEARTBEAT_INTERVAL = 10
 
 @document_bp.route('/', methods=['GET'])
 # @jwt_required()
@@ -97,6 +104,96 @@ def update_document_details(document_id):
         current_app.logger.error(f"Error updating details for document {document_id}: {e}")
         return jsonify({"error": "Gagal memperbarui detail dokumen", "details": str(e)}), 500
 
+@document_bp.route('/images/<path:filepath>')
+def serve_document_image(filepath):
+    """
+    Menyajikan file gambar dari direktori yang dikonfigurasi.
+    Menangani berbagai format path lama yang mungkin tersimpan di database.
+    """
+    image_directory = current_app.config.get('PDF_IMAGES_DIRECTORY')
+    
+    if not image_directory:
+        current_app.logger.error("PDF_IMAGES_DIRECTORY tidak diatur dalam konfigurasi.")
+        return jsonify({"error": "Konfigurasi server untuk gambar tidak lengkap."}), 500
+
+    # DECODE URL ENCODING (sangat penting untuk spasi dan karakter khusus)
+    filepath = unquote(filepath)
+    current_app.logger.info(f"[1] Original filepath (after decode): '{filepath}'")
+
+    # --- LOGIKA PEMBERSIHAN PATH ---
+    safe_filepath = filepath
+    
+    # Daftar prefix yang perlu dihapus
+    prefixes_to_strip = [
+        "data/onlineData/png/",
+        "data/pdf_images/",
+        "pdf_images/",
+        image_directory + "/",
+    ]
+    
+    # Hapus prefix yang ditemukan
+    for prefix in prefixes_to_strip:
+        if safe_filepath.startswith(prefix):
+            safe_filepath = safe_filepath[len(prefix):]
+            current_app.logger.info(f"[2] Stripped prefix '{prefix}'. New path: '{safe_filepath}'")
+            break
+    
+    # PENTING: Gunakan forward slash untuk Flask compatibility
+    safe_filepath = safe_filepath.replace('\\', '/')
+    current_app.logger.info(f"[3] After slash normalization: '{safe_filepath}'")
+    
+    # Konstruksi full path untuk validasi
+    full_path = os.path.join(image_directory, safe_filepath)
+    full_path = os.path.abspath(full_path)
+    current_app.logger.info(f"[4] Full path to check: '{full_path}'")
+    current_app.logger.info(f"[5] File exists: {os.path.isfile(full_path)}")
+    
+    # Debug: Cek parent directory
+    parent_dir = os.path.dirname(full_path)
+    current_app.logger.info(f"[6] Parent dir: '{parent_dir}' exists: {os.path.isdir(parent_dir)}")
+    
+    if os.path.isdir(parent_dir):
+        files = os.listdir(parent_dir)
+        current_app.logger.info(f"[7] Files in parent: {files}")
+    
+    # Keamanan: Pastikan path tidak keluar dari image_directory
+    if not full_path.startswith(os.path.abspath(image_directory)):
+        current_app.logger.warning(f"[SECURITY] Path traversal blocked.")
+        return jsonify({"error": "Invalid file path."}), 403
+
+    try:
+        # Cek apakah file ada
+        if not os.path.isfile(full_path):
+            current_app.logger.error(f"[ERROR] File not found: {full_path}")
+            return jsonify({
+                "error": "File gambar tidak ditemukan.",
+                "debug": {
+                    "filepath_received": filepath,
+                    "safe_filepath": safe_filepath,
+                    "full_path": full_path,
+                    "parent_exists": os.path.isdir(os.path.dirname(full_path))
+                }
+            }), 404
+        
+        current_app.logger.info(f"[SUCCESS] Attempting to serve: directory='{image_directory}', file='{safe_filepath}'")
+        
+        # Coba langsung dengan full path jika send_from_directory gagal
+        return send_from_directory(image_directory, safe_filepath)
+        
+    except Exception as e:
+        current_app.logger.error(f"[EXCEPTION] Error: {e}", exc_info=True)
+        
+        # Fallback: Coba kirim file secara langsung
+        try:
+            current_app.logger.info("[FALLBACK] Trying direct file send...")
+            from flask import send_file
+            return send_file(full_path, mimetype='image/png')
+        except Exception as e2:
+            current_app.logger.error(f"[FALLBACK FAILED] {e2}")
+            return jsonify({"error": "Gagal menyajikan gambar.", "details": str(e)}), 500
+
+
+    
 @document_bp.route('/<uuid:document_id>', methods=['DELETE'])
 # @jwt_required() # Sangat disarankan untuk mengaktifkan ini untuk keamanan
 def delete_document(document_id):
@@ -132,60 +229,61 @@ def delete_document(document_id):
         current_app.logger.error(f"Error deleting document {document_id}: {e}")
         return jsonify({"error": "Gagal menghapus dokumen", "details": str(e)}), 500
     
-@document_bp.route('/<uuid:document_id>/tables', methods=['GET'])
+@document_bp.route('/<uuid:document_id>/pages', methods=['GET'])
 # @jwt_required()
-def get_document_table_pages(document_id):
+def get_document_pages(document_id):
     """
-    Mengembalikan detail sebuah dokumen beserta daftar halaman yang
-    terdeteksi sebagai tabel.
+    Mengembalikan daftar halaman dari sebuah dokumen, dengan opsi filter
+    untuk menampilkan 'table' atau 'text'.
     """
     try:
-        # Mengambil dokumen atau mengembalikan error 404 jika tidak ditemukan
         doc = db.get_or_404(PdfDocument, document_id)
-
         page = request.args.get('page', 1, type=int)
         per_page = request.args.get('per_page', 10, type=int)
+        filter_type = request.args.get('filter', 'table', type=str) # Default ke 'table'
+
+        query = DocumentChunk.query.filter(DocumentChunk.document_id == document_id)
+
+        if filter_type in ['table', 'text']:
+            query = query.filter(DocumentChunk.chunk_metadata.op('->>')('type') == filter_type)
         
-        table_chunks_query = DocumentChunk.query.filter(
-            DocumentChunk.document_id == document_id,
-        ).order_by(DocumentChunk.page_number)
+        paginated_chunks = query.order_by(DocumentChunk.page_number).paginate(
+            page=page, per_page=per_page, error_out=False
+        )
+        
+        pages_data = []
+        for chunk in paginated_chunks.items:
+            chunk_data = {
+                "chunk_id": chunk.id,
+                "page_number": chunk.page_number,
+                "type": chunk.chunk_metadata.get('type'),
+                "status": "Sudah Direkonstruksi" if chunk.reconstructed_content else "Belum Direkonstruksi",
+            }
+            # PERUBAHAN 1: Sertakan konten teks jika filter adalah 'text'
+            if filter_type == 'text':
+                chunk_data['chunk_content'] = chunk.chunk_content
+                chunk_data['reconstructed_content'] = chunk.reconstructed_content
+            else: # Untuk tabel, sertakan path gambar
+                 chunk_data['image_path'] = f"/documents/images/{chunk.chunk_metadata.get('image_path')}" if chunk.chunk_metadata.get('image_path') else None
 
+            pages_data.append(chunk_data)
 
-        all_table_chunks = [
-            chunk for chunk in table_chunks_query.all()
-            if chunk.chunk_metadata and chunk.chunk_metadata.get('type') == 'table'
-        ]
-
-        total_items = len(all_table_chunks)
-        start = (page - 1) * per_page
-        end = start + per_page
-        paginated_chunks = all_table_chunks[start:end]
-        total_pages = (total_items + per_page - 1) // per_page if total_items > 0 else total_pages
-
-        results = {
+        return jsonify({
             "id": doc.id,
             "filename": doc.filename,
             "pagination": {
-                "total_items": total_items,
-                "total_pages": total_pages,
-                "current_page": page,
-                "per_page": per_page,
-                "has_next": end < total_items,
-                "has_prev": start > 0
+                "total_items": paginated_chunks.total,
+                "total_pages": paginated_chunks.pages,
+                "current_page": paginated_chunks.page,
+                "per_page": paginated_chunks.per_page,
+                "has_next": paginated_chunks.has_next,
+                "has_prev": paginated_chunks.has_prev
             },
-            "table_pages": [
-                {
-                    "chunk_id": chunk.id,
-                    "page_number": chunk.page_number,
-                    "image_path": f"/static/{chunk.chunk_metadata.get('image_path')}" if chunk.chunk_metadata.get('image_path') else None,
-                    "detection_reason": chunk.chunk_metadata.get('detection_reason'),
-                    "status": "Sudah Direkonstruksi" if chunk.reconstructed_content else "Belum Direkonstruksi"
-                } for chunk in paginated_chunks
-            ]
-        }
-        return jsonify(results), 200
+            "pages": pages_data
+        }), 200
     except Exception as e:
-        return jsonify({"error": "Gagal mengambil detail dokumen", "details": str(e)}), 500
+        current_app.logger.error(f"Error getting document pages for {document_id}: {e}")
+        return jsonify({"error": "Gagal mengambil detail halaman dokumen", "details": str(e)}), 500
     
 
 @document_bp.route('/chunk/<uuid:chunk_id>', methods=['GET'])
@@ -200,7 +298,7 @@ def get_chunk_details(chunk_id):
         return jsonify({
             "chunk_id": chunk.id,
             "page_number": chunk.page_number,
-            "image_path": f"/static/{chunk.chunk_metadata.get('image_path')}" if chunk.chunk_metadata.get('image_path') else None,
+            "image_path": f"/api/documents/images/{chunk.chunk_metadata.get('image_path')}" if chunk.chunk_metadata.get('image_path') else None,
             "chunk_content": chunk.chunk_content, # Teks mentah/sebelumnya
             "reconstructed_content": chunk.reconstructed_content # Teks yang sudah bersih (jika ada)
         }), 200
@@ -302,138 +400,315 @@ def update_chunk_content(chunk_id):
 def run_pdf_chunking(app, job_name):
     """
     Worker yang berjalan di background untuk memproses semua PDF di folder.
+    Dengan mekanisme interrupt dan laporan kegagalan yang detail.
     """
+    job_id = None
+    
     with app.app_context():
-        job = BatchJob.query.filter_by(job_name=job_name).first()
-        if not job or job.status != JobStatus.RUNNING:
-            app.logger.warning(f"PDF Chunking worker for {job_name} started but job is not in RUNNING state.")
-            return
-
-        stop_signal_received = False
-        
         try:
+            # 1. VALIDASI INITIAL STATE
+            job = BatchJob.query.filter_by(job_name=job_name).with_for_update().first()
+            if not job or job.status != JobStatus.RUNNING:
+                app.logger.warning(f"PDF Chunking worker for {job_name} started but job is not in RUNNING state.")
+                return
+            
+            job_id = job.id
+            app.logger.info(f"[CHUNKING] Starting job {job_name} (ID: {job_id})")
+
+            # 2. VALIDASI DIREKTORI
             pdf_directory = app.config.get('PDF_CHUNK_DIRECTORY')
+            if not pdf_directory or not os.path.isdir(pdf_directory):
+                raise Exception(f"PDF directory not found or invalid: {pdf_directory}")
+
             pdf_files = [f for f in os.listdir(pdf_directory) if f.lower().endswith('.pdf')]
             total_files = len(pdf_files)
 
-            # PERBAIKAN 1: Gunakan enumerate untuk penghitungan yang akurat
-            for i, filename in enumerate(pdf_files, 1):
-                current_status = db.session.query(BatchJob.status).filter_by(id=job.id).scalar()
-                if current_status == JobStatus.STOPPING:
-                    app.logger.info(f"Stop signal for {job_name} detected. Finalizing...")
-                    stop_signal_received = True
-                    break
-                
-                # FITUR BARU: Update pesan status sebelum memproses
-                update_payload = {
-                    'last_error': f"Memproses file {i}/{total_files}: {filename}"
-                }
-                BatchJob.query.filter_by(id=job.id).update(update_payload)
-                db.session.commit()
+            if total_files == 0:
+                app.logger.info(f"[CHUNKING] No PDF files to process.")
+                cleanup_job_state(job_name, JobStatus.COMPLETED, "Tidak ada file PDF untuk diproses.")
+                return
 
-                pdf_path = os.path.join(pdf_directory, filename)
-                try:
-                    process_and_save_pdf(pdf_path)
-                    
-                    # PERBAIKAN 2: Update progress dengan `i`, bukan akumulasi manual
-                    BatchJob.query.filter_by(id=job.id).update({'processed_items': i})
-                    db.session.commit()
+            app.logger.info(f"[CHUNKING] Found {total_files} PDF files to process.")
 
-                    app.logger.info(f"Successfully chunked '{filename}'. Progress: {i}/{total_files}")
-
-                except Exception as e:
-                    app.logger.error(f"Failed to process '{filename}': {e}")
-                
-                time.sleep(1) # Jeda singkat
-
-            db.session.refresh(job)
-            final_update = {}
-            if stop_signal_received:
-                final_update['status'] = JobStatus.IDLE
-                final_update['last_error'] = "Proses dihentikan oleh pengguna."
-            else:
-                final_update['status'] = JobStatus.COMPLETED
-                final_update['last_error'] = f"Selesai: {job.processed_items} file berhasil diproses."
+            # 3. PROSES SETIAP FILE DENGAN INTERRUPT CHECKING
+            processed_count = 0
+            error_count = 0
+            skipped_count = 0
             
-            BatchJob.query.filter_by(id=job.id).update(final_update)
-            db.session.commit()
+            # <--- PERUBAHAN 1: Tambahkan list untuk menyimpan detail kegagalan --->
+            failed_files_details = []
+
+            for i, filename in enumerate(pdf_files, 1):
+                try:
+                    # Cek stop signal
+                    if check_job_should_stop(job_id):
+                        app.logger.info(f"[CHUNKING] Stop signal detected before processing file {i}/{total_files}")
+                        # Pesan saat berhenti juga bisa lebih informatif
+                        stop_msg = f"Proses dihentikan oleh pengguna. Berhasil: {processed_count}, Gagal: {error_count}, Dilewati: {skipped_count}."
+                        cleanup_job_state(job_name, JobStatus.IDLE, stop_msg)
+                        return
+
+                    status_msg = f"Mempersiapkan file {i}/{total_files}: {filename}"
+                    update_job_heartbeat(job_id, message=status_msg)
+                    app.logger.info(f"[CHUNKING] Processing {i}/{total_files}: {filename}")
+
+                    pdf_path = os.path.join(pdf_directory, filename)
+                    
+                    def progress_callback(message: str):
+                        update_job_heartbeat(job_id, message=message)
+                        app.logger.info(f"[CHUNKING]   -> {message}")
+                    
+                    result = process_and_save_pdf(
+                        pdf_path, 
+                        job_id,
+                        progress_callback=progress_callback
+                    )
+
+                    # <--- PERUBAHAN 2: Logika untuk mencatat status setiap file --->
+                    status = result.get("status")
+                    reason = result.get("reason", "Unknown error")
+
+                    if status == "stopped":
+                        app.logger.info(f"[CHUNKING] Processing of {filename} was stopped by user.")
+                        stop_msg = f"Proses dihentikan pada file '{filename}'. Berhasil: {processed_count}, Gagal: {error_count}, Dilewati: {skipped_count}."
+                        cleanup_job_state(job_name, JobStatus.IDLE, stop_msg)
+                        return
+                    elif status == "success":
+                        processed_count += 1
+                        app.logger.info(f"[CHUNKING] ✓ Success: {filename}")
+                    elif status == "skipped":
+                        skipped_count += 1
+                        app.logger.info(f"[CHUNKING] ○ Skipped: {filename} - {reason}")
+                    else: # "error" atau "failed"
+                        error_count += 1
+                        # Simpan nama file dan alasan kegagalan
+                        failed_files_details.append(f"- {filename}: {reason}")
+                        app.logger.error(f"[CHUNKING] ✗ Failed: {filename} - {reason}")
+                    
+                    update_job_heartbeat(job_id, processed_count=(processed_count + skipped_count + error_count))
+                    time.sleep(0.5)
+
+                except Exception as iter_error:
+                    error_count += 1
+                    error_msg = f"Error kritis pada iterasi '{filename}': {str(iter_error)}"
+                    failed_files_details.append(f"- {filename}: {error_msg}")
+                    app.logger.error(f"[CHUNKING] ✗ {error_msg}")
+                    app.logger.error(traceback.format_exc())
+
+            # 4. FINALISASI DENGAN PESAN YANG LEBIH DETAIL
+            # <--- PERUBAHAN 3: Buat pesan akhir yang informatif --->
+            final_status = JobStatus.COMPLETED
+            final_msg = f"Selesai. Berhasil: {processed_count}, Gagal: {error_count}, Dilewati: {skipped_count} dari total {total_files} file."
+
+            if error_count > 0:
+                # Jika ada error, ubah status dan tambahkan detail kegagalan
+                final_status = JobStatus.FAILED if processed_count == 0 else JobStatus.COMPLETED
+                final_msg = f"Selesai dengan peringatan. Berhasil: {processed_count}, Gagal: {error_count}, Dilewati: {skipped_count}."
+                
+                # Gabungkan detail kegagalan menjadi satu string
+                failures_string = "\n".join(failed_files_details)
+                final_msg += f"\n\nDetail Kegagalan:\n{failures_string}"
+
+            cleanup_job_state(job_name, final_status, final_msg)
+            app.logger.info(f"[CHUNKING] Job completed: {final_msg}")
 
         except Exception as e:
-            db.session.rollback()
-            app.logger.error(f"A critical error occurred in the PDF chunking worker {job_name}: {e}", exc_info=True)
-            job = BatchJob.query.filter_by(job_name=job_name).first()
-            if job:
-                job.status = JobStatus.FAILED
-                job.last_error = f"Error kritis: {str(e)}"
-                db.session.commit()
+            error_trace = traceback.format_exc()
+            app.logger.error(f"[CHUNKING] FATAL ERROR in worker: {e}")
+            app.logger.error(error_trace)
+            cleanup_job_state(job_name, JobStatus.FAILED, f"Error fatal: {str(e)[:200]}")
+
+        finally:
+            try:
+                db.session.remove()
+            except:
+                pass
 
 # --- ENDPOINT API BARU UNTUK KONTROL CHUNKING JOB ---
 @document_bp.route('/chunking/start', methods=['POST'])
 # @jwt_required()
 def start_chunking_job():
+    """Start chunking job dengan stuck detection."""
     job_name = 'pdf_chunking_process'
-    job = BatchJob.query.filter_by(job_name=job_name).first()
-    if not job:
-        job = BatchJob(job_name=job_name)
-        db.session.add(job)
     
-    if job.status == JobStatus.RUNNING:
-        return jsonify({"error": "Proses chunking sudah berjalan."}), 409
+    try:
+        job = BatchJob.query.filter_by(job_name=job_name).with_for_update().first()
+        
+        # BUAT JOB BARU JIKA BELUM ADA
+        if not job:
+            job = BatchJob(job_name=job_name)
+            db.session.add(job)
+            db.session.flush()
+        
+        # CEK APAKAH JOB STUCK (RUNNING TAPI SUDAH LAMA TIDAK UPDATE)
+        if job.status == JobStatus.RUNNING:
+            if job.last_updated:
+                time_since_update = datetime.utcnow() - job.last_updated
+                if time_since_update > timedelta(minutes=JOB_TIMEOUT_MINUTES):
+                    app_logger = current_app.logger
+                    app_logger.warning(f"[CHUNKING] Job stuck detected! Last update: {job.last_updated}. Resetting...")
+                    
+                    # RESET JOB YANG STUCK
+                    job.status = JobStatus.IDLE
+                    job.last_error = f"Job direset karena stuck (tidak ada update sejak {job.last_updated})"
+                    db.session.commit()
+                else:
+                    return jsonify({
+                        "error": "Proses chunking sudah berjalan.",
+                        "last_update": job.last_updated.isoformat(),
+                        "progress": f"{job.processed_items}/{job.total_items}"
+                    }), 409
+            else:
+                return jsonify({"error": "Proses chunking sudah berjalan."}), 409
 
-    pdf_directory = current_app.config.get('PDF_CHUNK_DIRECTORY')
-    if not pdf_directory or not os.path.isdir(pdf_directory):
-        return jsonify({"error": "Folder PDF tidak dikonfigurasi atau tidak ditemukan."}), 500
+        # VALIDASI DIREKTORI
+        pdf_directory = current_app.config.get('PDF_CHUNK_DIRECTORY')
+        if not pdf_directory or not os.path.isdir(pdf_directory):
+            return jsonify({"error": "Folder PDF tidak dikonfigurasi atau tidak ditemukan."}), 500
 
-    files_to_process = [f for f in os.listdir(pdf_directory) if f.lower().endswith('.pdf')]
-    if not files_to_process:
-        return jsonify({"message": "Tidak ada file PDF baru untuk diproses."}), 200
+        # HITUNG FILE YANG AKAN DIPROSES
+        files_to_process = [f for f in os.listdir(pdf_directory) if f.lower().endswith('.pdf')]
+        if not files_to_process:
+            return jsonify({"message": "Tidak ada file PDF baru untuk diproses."}), 200
 
-    job.status = JobStatus.RUNNING
-    job.total_items = len(files_to_process)
-    job.processed_items = 0
-    job.started_at = datetime.utcnow()
-    job.completed_at = None
-    job.last_error = "Memulai proses..." # Pesan awal
-    db.session.commit()
+        # INISIALISASI JOB
+        job.status = JobStatus.RUNNING
+        job.total_items = len(files_to_process)
+        job.processed_items = 0
+        job.started_at = datetime.utcnow()
+        job.last_updated = datetime.utcnow()  # TAMBAHKAN HEARTBEAT TIMESTAMP
+        job.completed_at = None
+        job.last_error = "Memulai proses chunking..."
+        db.session.commit()
 
-    thread = threading.Thread(target=run_pdf_chunking, args=(current_app._get_current_object(), job_name))
-    thread.daemon = True
-    thread.start()
+        # JALANKAN WORKER THREAD
+        thread = threading.Thread(
+            target=run_pdf_chunking, 
+            args=(current_app._get_current_object(), job_name),
+            name=f"chunking-worker-{job.id}"
+        )
+        thread.daemon = True
+        thread.start()
 
-    return jsonify({"message": "Proses chunking PDF dimulai.", "total_files": len(files_to_process)}), 202
+        return jsonify({
+            "message": "Proses chunking PDF dimulai.",
+            "job_id": job.id,
+            "total_files": len(files_to_process)
+        }), 202
+
+    except Exception as e:
+        db.session.rollback()
+        current_app.logger.error(f"Error starting chunking job: {e}")
+        return jsonify({"error": "Gagal memulai proses chunking", "details": str(e)}), 500
 
 @document_bp.route('/chunking/stop', methods=['POST'])
 # @jwt_required()
 def stop_chunking_job():
+    """Stop chunking job dengan graceful shutdown."""
     job_name = 'pdf_chunking_process'
-    job = BatchJob.query.filter_by(job_name=job_name).first()
-    if not job or job.status not in [JobStatus.RUNNING, JobStatus.STOPPING]:
-        return jsonify({"error": "Tidak ada proses chunking yang sedang berjalan untuk dihentikan."}), 404
     
-    job.status = JobStatus.STOPPING
-    job.last_error = "Mengirim sinyal berhenti..." # Pesan saat menghentikan
-    db.session.commit()
-    return jsonify({"message": "Sinyal berhenti telah dikirim ke proses chunking."}), 200
+    try:
+        job = BatchJob.query.filter_by(job_name=job_name).with_for_update().first()
+        
+        if not job:
+            return jsonify({"error": "Job tidak ditemukan."}), 404
+        
+        if job.status not in [JobStatus.RUNNING, JobStatus.STOPPING]:
+            return jsonify({
+                "error": f"Tidak ada proses yang berjalan. Status saat ini: {job.status.value}"
+            }), 400
+        
+        # SET STATUS STOPPING
+        job.status = JobStatus.STOPPING
+        job.last_error = "Mengirim sinyal berhenti..."
+        job.last_updated = datetime.utcnow()
+        db.session.commit()
+        
+        return jsonify({
+            "message": "Sinyal berhenti telah dikirim. Proses akan berhenti setelah file saat ini selesai."
+        }), 200
+    
+    except Exception as e:
+        db.session.rollback()
+        current_app.logger.error(f"Error stopping chunking job: {e}")
+        return jsonify({"error": "Gagal menghentikan proses", "details": str(e)}), 500
 
 @document_bp.route('/chunking/status', methods=['GET'])
 # @jwt_required()
 def get_chunking_job_status():
+    """Get status dengan stuck detection."""
     job_name = 'pdf_chunking_process'
-    job = BatchJob.query.filter_by(job_name=job_name).first()
-    if not job:
+    
+    try:
+        job = BatchJob.query.filter_by(job_name=job_name).first()
+        
+        if not job:
+            return jsonify({
+                "status": JobStatus.IDLE.value,
+                "progress": 0,
+                "total_items": 0,
+                "processed_items": 0,
+                "message": "Belum ada proses yang berjalan.",
+                "is_stuck": False
+            }), 200
+        
+        # DETEKSI STUCK
+        is_stuck = False
+        stuck_duration = None
+        
+        if job.status == JobStatus.RUNNING and job.last_updated:
+            time_since_update = datetime.utcnow() - job.last_updated
+            if time_since_update > timedelta(minutes=JOB_TIMEOUT_MINUTES):
+                is_stuck = True
+                stuck_duration = int(time_since_update.total_seconds() / 60)
+        
         return jsonify({
-            "status": JobStatus.IDLE.value, "progress": 0, "total_items": 0,
-            "processed_items": 0, "last_error": "Belum ada proses yang berjalan."
+            "status": job.status.value,
+            "progress": job.get_progress(),
+            "total_items": job.total_items,
+            "processed_items": job.processed_items,
+            "message": job.last_error,
+            "started_at": job.started_at.isoformat() if job.started_at else None,
+            "last_updated": job.last_updated.isoformat() if job.last_updated else None,
+            "is_stuck": is_stuck,
+            "stuck_duration_minutes": stuck_duration
         }), 200
     
-    # PERBAIKAN 3: Ubah nama field 'last_error' menjadi 'message' untuk kejelasan di frontend
-    return jsonify({
-        "status": job.status.value, 
-        "progress": job.get_progress(),
-        "total_items": job.total_items, 
-        "processed_items": job.processed_items,
-        "message": job.last_error # Mengirim pesan status ke frontend
-    }), 200
+    except Exception as e:
+        current_app.logger.error(f"Error getting chunking status: {e}")
+        return jsonify({"error": "Gagal mengambil status", "details": str(e)}), 500
+    
+@document_bp.route('/chunking/reset', methods=['POST'])
+# @jwt_required()
+def reset_stuck_job():
+    """
+    ENDPOINT BARU: Reset job yang stuck secara manual.
+    Berguna jika auto-detection tidak bekerja.
+    """
+    job_name = 'pdf_chunking_process'
+    
+    try:
+        job = BatchJob.query.filter_by(job_name=job_name).with_for_update().first()
+        
+        if not job:
+            return jsonify({"error": "Job tidak ditemukan."}), 404
+        
+        # FORCE RESET KE IDLE
+        old_status = job.status.value
+        job.status = JobStatus.IDLE
+        job.last_error = f"Job direset secara manual dari status {old_status} pada {datetime.utcnow()}"
+        job.completed_at = datetime.utcnow()
+        db.session.commit()
+        
+        return jsonify({
+            "message": f"Job berhasil direset dari status {old_status} ke IDLE.",
+            "previous_progress": f"{job.processed_items}/{job.total_items}"
+        }), 200
+    
+    except Exception as e:
+        db.session.rollback()
+        current_app.logger.error(f"Error resetting job: {e}")
+        return jsonify({"error": "Gagal mereset job", "details": str(e)}), 500
 
 @document_bp.route('/process-folder', methods=['POST'])
 # @jwt_required()

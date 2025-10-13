@@ -14,6 +14,7 @@ from .models import db, PdfDocument, DocumentChunk
 from flask import current_app
 from cachetools import TTLCache
 import shutil
+from .job_utils import check_job_should_stop
 
 logging.basicConfig(level=logging.INFO)
 
@@ -317,57 +318,122 @@ class RobustTableDetector:
         return all_chunks
 
 
-def process_and_save_pdf(pdf_path: str) -> Dict[str, Any]:
+def process_and_save_pdf(pdf_path: str, job_id: int = None, progress_callback=None) -> Dict[str, Any]:
+    """
+    Memproses PDF dengan logika resume dan commit per halaman untuk memastikan
+    integritas data saat proses dihentikan atau gagal.
+    """
     base_filename = os.path.splitext(os.path.basename(pdf_path))[0]
+    original_filename = os.path.basename(pdf_path)
+    
+    # <--- PERUBAHAN 1: LOGIKA GET-OR-CREATE DENGAN RESUME --->
+    document = None
+    start_page = 1
+    
     try:
+        # Selalu buka file untuk menghitung hash dan total halaman
         file_hash = hashlib.sha256(open(pdf_path, "rb").read()).hexdigest()
-        existing_doc = PdfDocument.query.filter_by(document_hash=file_hash).first()
-        if existing_doc:
-            return {"status": "skipped", "filename": os.path.basename(pdf_path), "reason": "Dokumen sudah ada di database."}
-
-        # Gunakan kelas detektor yang baru
-        detector = RobustTableDetector()
-        labeled_chunks = detector.extract_and_label_pages(pdf_path)
         
-        if not labeled_chunks:
-            return {"status": "failed", "filename": os.path.basename(pdf_path), "reason": "Tidak ada konten yang bisa diekstrak."}
+        # Cek apakah dokumen sudah ada berdasarkan hash
+        document = PdfDocument.query.filter_by(document_hash=file_hash).first()
 
-        new_document = PdfDocument(
-            filename=os.path.basename(pdf_path),
-            total_pages=len(labeled_chunks),
-            document_hash=file_hash,
-            doc_metadata={'source_path': pdf_path}
-        )
-        db.session.add(new_document)
-        db.session.flush() # Dapatkan ID dokumen sebelum commit
+        doc_for_pages = fitz.open(pdf_path)
+        total_pages = len(doc_for_pages)
+        doc_for_pages.close()
 
-        for chunk_data in labeled_chunks:
-            # Hanya proses/simpan chunk yang bukan halaman exclude
-            if not chunk_data['metadata']['is_excluded']:
-                new_chunk = DocumentChunk(
-                    document_id=new_document.id,
-                    page_number=chunk_data['page_number'],
-                    chunk_content=chunk_data['content'],
-                    # Simpan semua metadata hasil deteksi ke database
-                    chunk_metadata=chunk_data['metadata'] 
-                )
-                db.session.add(new_chunk)
+        if document:
+            # Dokumen sudah ada, cek halaman terakhir yang diproses
+            last_chunk = DocumentChunk.query.filter_by(document_id=document.id)\
+                .order_by(DocumentChunk.page_number.desc()).first()
             
-        db.session.commit()
-        return {"status": "success", "filename": os.path.basename(pdf_path), "pages_chunked": len(labeled_chunks)}
-
+            if last_chunk:
+                # Jika semua halaman sudah diproses, lewati file ini
+                if last_chunk.page_number >= total_pages:
+                    logging.info(f"Skipping '{original_filename}': Sudah selesai diproses.")
+                    return {"status": "skipped", "filename": original_filename, "reason": "Dokumen sudah selesai diproses."}
+                
+                # Tentukan halaman awal untuk melanjutkan
+                start_page = last_chunk.page_number + 1
+                logging.info(f"Resuming '{original_filename}' from page {start_page}.")
+            # Jika dokumen ada tapi tidak ada chunk (kasus aneh), mulai dari awal
+            else:
+                 start_page = 1
+        else:
+            # Dokumen baru, buat instance baru
+            document = PdfDocument(
+                filename=original_filename,
+                total_pages=total_pages,
+                document_hash=file_hash,
+                doc_metadata={'source_path': pdf_path}
+            )
+            # Jangan di-add ke session dulu, tunggu sampai chunk pertama siap
+            
     except Exception as e:
-        db.session.rollback()
-        logging.error(f"Error processing {pdf_path}: {e}")
+        logging.error(f"Gagal saat inisialisasi pra-proses untuk {pdf_path}: {e}")
+        return {"status": "error", "filename": original_filename, "reason": f"Initialization error: {str(e)}"}
 
-        image_dir = current_app.config.get('PDF_IMAGES_DIRECTORY')
-        if image_dir:
-            doc_image_folder = os.path.join(image_dir, base_filename)
-            if os.path.isdir(doc_image_folder):
-                try:
-                    shutil.rmtree(doc_image_folder)
-                    logging.info(f"Rollback: Cleaned up image folder {doc_image_folder} due to processing error.")
-                except Exception as cleanup_error:
-                    logging.error(f"Error during image cleanup for {base_filename}: {cleanup_error}")
+    # --- AKHIR PERUBAHAN 1 ---
 
-        return {"status": "error", "filename": os.path.basename(pdf_path), "reason": str(e)}
+    detector = RobustTableDetector()
+    doc = fitz.open(pdf_path)
+    
+    # Pastikan loop dimulai dari halaman yang benar
+    for page_num, page in enumerate(doc, 1):
+        if page_num < start_page:
+            continue
+
+        try:
+            # CEK STOP SIGNAL SEBELUM MEMPROSES SETIAP HALAMAN
+            if job_id and check_job_should_stop(job_id):
+                doc.close()
+                logging.info(f"Proses dihentikan oleh pengguna sebelum halaman {page_num} pada file '{original_filename}'. Progress tersimpan.")
+                return {"status": "stopped", "filename": original_filename, "reason": f"Dihentikan oleh pengguna pada halaman {page_num}"}
+
+            if progress_callback:
+                message = f"Menganalisis Halaman {page_num}/{total_pages} (File: {original_filename})"
+                progress_callback(message=message)
+
+            raw_text = page.get_text("text")
+            is_table, reason = detector._detect_table_page(raw_text, page_num)
+            
+            # Hanya proses/simpan chunk yang bukan halaman exclude
+            if reason == "excluded_page":
+                continue
+
+            content_type = "table" if is_table else "text"
+            image_path = None
+            if is_table:
+                image_path = detector._save_page_screenshot(page, base_filename, page_num)
+
+            # <--- PERUBAHAN 2: COMMIT PER HALAMAN --->
+            
+            # Jika ini dokumen baru, sekarang saatnya menambahkannya ke DB
+            if not document.id:
+                db.session.add(document)
+                db.session.flush() # flush untuk mendapatkan ID dokumen baru
+
+            new_chunk = DocumentChunk(
+                document_id=document.id,
+                page_number=page_num,
+                chunk_content=detector._clean_text_for_rag(raw_text),
+                chunk_metadata={
+                    "type": content_type,
+                    "image_path": image_path,
+                    "detection_reason": reason,
+                    "is_excluded": False
+                }
+            )
+            db.session.add(new_chunk)
+            db.session.commit() # Simpan progress untuk halaman ini secara permanen
+            
+            # --- AKHIR PERUBAHAN 2 ---
+
+        except Exception as e:
+            db.session.rollback() # Batalkan hanya transaksi halaman ini yang gagal
+            doc.close()
+            logging.error(f"Gagal memproses halaman {page_num} dari '{pdf_path}': {e}")
+            # Hentikan proses untuk file ini karena terjadi error, tapi progress sebelumnya aman
+            return {"status": "error", "filename": original_filename, "reason": f"Error on page {page_num}: {str(e)}"}
+            
+    doc.close()
+    return {"status": "success", "filename": original_filename, "pages_chunked": total_pages - start_page + 1}

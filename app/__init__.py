@@ -25,8 +25,11 @@ def create_app():
     # app.config['SECRET_KEY'] = os.getenv('SECRET_KEY', 'a-super-secret-key')
     app.config["JWT_SECRET_KEY"] = os.getenv('JWT_SECRET_KEY')
 
-    app.config['PDF_IMAGES_DIRECTORY'] = os.path.join(app.static_folder, 'pdf_images')
-    app.config['PDF_CHUNK_DIRECTORY'] = os.getenv('PDF_CHUNK_DIRECTORY', 'data/chunkPdf') 
+    # app.config['PDF_IMAGES_DIRECTORY'] = os.path.join(app.static_folder, 'pdf_images')
+    # app.config['PDF_CHUNK_DIRECTORY'] = os.getenv('PDF_CHUNK_DIRECTORY', 'data/chunkPdf') 
+    app.config['PDF_CHUNK_DIRECTORY'] = os.getenv('PDF_CHUNK_DIRECTORY', 'data/onlineData/pdf') 
+    # Path untuk folder tujuan penyimpanan gambar hasil chunk
+    app.config['PDF_IMAGES_DIRECTORY'] = os.getenv('PDF_IMAGES_DIRECTORY', 'data/onlineData/png')
 
     app.config["JWT_ACCESS_TOKEN_EXPIRES"] = timedelta(hours=1)
     app.config["JWT_REFRESH_TOKEN_EXPIRES"] = timedelta(days=30)

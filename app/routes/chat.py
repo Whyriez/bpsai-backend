@@ -1,7 +1,10 @@
 import time
 import json
 import uuid
-from flask import Blueprint, request, Response, session, current_app, jsonify
+import re
+import pandas as pd
+import io
+from flask import Blueprint, request, Response, session, current_app, jsonify, send_file
 from app.models import db, BeritaBps, DocumentChunk, PromptLog, Feedback 
 from app.services import EmbeddingService, GeminiService
 from app.vector_db import get_collections
@@ -120,7 +123,7 @@ def stream():
                     
                     # Step 3: Mencari data relevan
                     yield send_thinking_status("searching", "Mencari data statistik relevan...")
-                    relevant_items = get_combined_relevant_results(user_prompt, limit=15)
+                    relevant_items = get_combined_relevant_results(user_prompt, limit=10)
                     
                     # Step 4: Ranking ulang hasil
                     if relevant_items:
@@ -201,11 +204,25 @@ def update_log_after_streaming(app, log_id, model_response, start_time):
 
 @chat_bp.route('/history/<conversation_id>', methods=['GET'])
 def get_history(conversation_id):
+    page = request.args.get('page', 1, type=int)
+    per_page = request.args.get('per_page', 20, type=int)
+    
     if not conversation_id:
         return jsonify({'error': 'Conversation ID is required'}), 400
 
     try:
-        history_logs = PromptLog.query.filter_by(session_id=conversation_id).order_by(PromptLog.id.asc()).all()
+        # Hitung total untuk pagination
+        total_logs = PromptLog.query.filter_by(session_id=conversation_id).count()
+        
+        # Ambil data dengan pagination
+        history_logs = PromptLog.query.filter_by(session_id=conversation_id)\
+            .order_by(PromptLog.id.desc())\
+            .offset((page - 1) * per_page)\
+            .limit(per_page)\
+            .all()
+        
+        history_logs.reverse()  # Urutkan ascending untuk tampilan
+        
         formatted_history = []
         for log in history_logs:
             if log.user_prompt and log.model_response and not log.model_response.lower().startswith('error'):
@@ -218,7 +235,82 @@ def get_history(conversation_id):
                     'model_response': log.model_response,
                     'has_feedback': feedback_type 
                 })
-        return jsonify(formatted_history)
+        
+        return jsonify({
+            'messages': formatted_history,
+            'pagination': {
+                'page': page,
+                'per_page': per_page,
+                'total': total_logs,
+                'has_more': page * per_page < total_logs
+            }
+        })
     except Exception as e:
         current_app.logger.error(f'Error fetching history for {conversation_id}: {e}')
         return jsonify({'error': 'Gagal mengambil riwayat percakapan.'}), 500
+    
+
+def sanitize_filename(filename):
+    """Membersihkan string agar menjadi nama file yang valid."""
+    # Hapus karakter yang tidak diizinkan di sebagian besar sistem file
+    filename = re.sub(r'[\\/*?:"<>|]', "", filename)
+    # Ganti spasi dengan underscore
+    filename = filename.strip().replace(' ', '_')
+    # Batasi panjangnya untuk menghindari masalah
+    return filename[:100]
+
+@chat_bp.route('/export/excel', methods=['POST'])
+def export_to_excel():
+    """
+    Menerima tabel dalam format Markdown, mengubahnya menjadi file Excel,
+    dan mengirimkannya kembali untuk diunduh.
+    """
+    data = request.json
+    markdown_table = data.get('markdown_table')
+    title = data.get('title', 'data_ekspor')
+
+    if not markdown_table:
+        return jsonify({"error": "Data tabel Markdown tidak ditemukan"}), 400
+
+    try:
+        lines = markdown_table.strip().split('\n')
+        
+        # Ekstrak header dan baris data
+        header_line = lines[0]
+        separator_line = lines[1] # Garis pemisah seperti |---|---|
+        data_lines = lines[2:]
+
+        # Bersihkan header
+        headers = [h.strip() for h in header_line.split('|') if h.strip()]
+        
+        # Bersihkan baris data
+        data_rows = []
+        for line in data_lines:
+            row = [d.strip() for d in line.split('|') if d.strip()]
+            if row: # Pastikan baris tidak kosong
+                data_rows.append(row)
+
+        # Buat DataFrame pandas
+        df = pd.DataFrame(data_rows, columns=headers)
+
+        # Buat file Excel di dalam memori (tanpa menyimpan di server)
+        output = io.BytesIO()
+        writer = pd.ExcelWriter(output, engine='openpyxl')
+        df.to_excel(writer, index=False, sheet_name='Data Ekspor')
+        writer.close() # Ganti writer.save() dengan writer.close() untuk versi pandas yang lebih baru
+        output.seek(0)
+
+        safe_filename = sanitize_filename(title)
+        download_name = f"{safe_filename}.xlsx"
+
+        # Kirim file ke pengguna untuk diunduh
+        return send_file(
+            output,
+            mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+            as_attachment=True,
+            download_name=download_name
+        )
+
+    except Exception as e:
+        current_app.logger.error(f"Gagal mengekspor ke Excel: {e}")
+        return jsonify({"error": f"Terjadi kesalahan saat membuat file Excel: {str(e)}"}), 500

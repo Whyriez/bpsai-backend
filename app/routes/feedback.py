@@ -3,6 +3,7 @@ from app.models import db, Feedback, PromptLog, DocumentFeedbackScore
 from sqlalchemy.orm import joinedload
 from sqlalchemy import func
 import datetime
+from datetime import timezone
 from flask_jwt_extended import jwt_required
 
 feedback_bp = Blueprint('feedback', __name__, url_prefix='/api')
@@ -11,7 +12,7 @@ def format_time_ago(dt):
     """Mengubah objek datetime menjadi string 'time ago' yang mudah dibaca."""
     if not dt:
         return ""
-    now = datetime.datetime.utcnow()
+    now = datetime.datetime.now(timezone.utc)
     diff = now - dt
     
     seconds = diff.total_seconds()

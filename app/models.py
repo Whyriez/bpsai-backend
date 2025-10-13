@@ -33,6 +33,8 @@ class BatchJob(db.Model):
     
     started_at = db.Column(db.DateTime, nullable=True)
     completed_at = db.Column(db.DateTime, nullable=True)
+
+    last_updated = db.Column(db.DateTime, nullable=True, default=datetime.utcnow)
     
     last_error = db.Column(db.Text, nullable=True) # Untuk menyimpan pesan error jika gagal
     
@@ -40,6 +42,31 @@ class BatchJob(db.Model):
         if self.total_items == 0:
             return 100.0
         return round((self.processed_items / self.total_items) * 100, 2)
+    
+    def is_stuck(self, timeout_minutes=30):
+        """
+        Cek apakah job stuck berdasarkan last_updated timestamp.
+        Return True jika job RUNNING tapi tidak ada update dalam {timeout_minutes} menit.
+        """
+        if self.status != JobStatus.RUNNING:
+            return False
+        
+        if not self.last_updated:
+            return False
+        
+        from datetime import datetime, timedelta
+        time_since_update = datetime.utcnow() - self.last_updated
+        return time_since_update > timedelta(minutes=timeout_minutes)
+    
+    def reset_to_idle(self, reason=None):
+        """Helper method untuk reset job ke IDLE dengan aman."""
+        self.status = JobStatus.IDLE
+        self.completed_at = datetime.utcnow()
+        if reason:
+            self.last_error = reason
+    
+    def __repr__(self):
+        return f"<BatchJob {self.job_name} status={self.status.value} progress={self.get_progress()}%>"
 
 class User(db.Model):
     __tablename__ = 'users'
