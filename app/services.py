@@ -10,7 +10,7 @@ import re
 import time
 import hashlib
 from typing import List, Dict, Any
-from .models import db, PdfDocument, DocumentChunk
+from .models import db, PdfDocument, DocumentChunk, GeminiApiKeyConfig
 from flask import current_app
 from cachetools import TTLCache
 import shutil
@@ -20,31 +20,67 @@ logging.basicConfig(level=logging.INFO)
 
 class EmbeddingService:
     def __init__(self):
-        api_keys_str = os.getenv('GEMINI_API_KEYS', "")
-        api_keys_list = [key.strip() for key in api_keys_str.split(',') if key.strip()]
-
-        if not api_keys_list:
-            self.api_key = None
-            logging.error("GEMINI_API_KEYS tidak diatur atau kosong di .env")
-        else:
-            self.api_key = api_keys_list[0]
+        # Gunakan method yang sama seperti GeminiService untuk load keys
+        self.api_keys = self._load_keys_from_env()
+        self.current_key_index = 0
+        self.url = None
+        self._update_url()
         
-        self.url = f"https://generativelanguage.googleapis.com/v1beta/models/text-embedding-004:embedContent?key={self.api_key}"
-  
         self.cache = TTLCache(maxsize=1000, ttl=3600)
-        # =========================================================
+
+    def _load_keys_from_env(self):
+        """Load API keys dari environment variables"""
+        keys = []
+        i = 1
+        while True:
+            env_key = f"GEMINI_API_KEY_{i}"
+            key_value = os.getenv(env_key)
+            if not key_value:
+                break
+            keys.append(key_value)
+            i += 1
+        
+        # Fallback ke format lama
+        if not keys:
+            old_keys_str = os.getenv('GEMINI_API_KEYS', '')
+            old_keys_list = [key.strip() for key in old_keys_str.split(',') if key.strip()]
+            keys.extend(old_keys_list)
+        
+        logging.info(f"Loaded {len(keys)} API keys for EmbeddingService")
+        return keys
+
+    def _update_url(self):
+        """Update URL dengan API key saat ini"""
+        if self.current_key_index < len(self.api_keys):
+            current_key = self.api_keys[self.current_key_index]
+            self.url = f"https://generativelanguage.googleapis.com/v1beta/models/text-embedding-004:embedContent?key={current_key}"
+        else:
+            self.url = None
+            logging.error("No valid API keys available for EmbeddingService")
+
+    def _rotate_key(self):
+        """Rotasi ke API key berikutnya"""
+        if self.current_key_index < len(self.api_keys) - 1:
+            self.current_key_index += 1
+            self._update_url()
+            logging.info(f"Rotated to API key index: {self.current_key_index}")
+        else:
+            logging.error("No more API keys to rotate to")
+            self.url = None
 
     def generate(self, text: str) -> list | None:
+        if not text:
+            return None
+
+        # Check cache
         if text in self.cache:
             logging.info(f"Embedding cache hit for text: '{text[:50]}...'")
             return self.cache[text]
 
-        if not text or not self.api_key:
-            if not self.api_key:
-                logging.error("Embedding generation failed: API key is None.")
+        if not self.api_keys or not self.url:
+            logging.error("Embedding generation failed: No API keys available")
             return None
         
-        # --- AWAL DARI LOGIKA RETRY ---
         retries = 3
         backoff_factor = 2
         
@@ -52,58 +88,111 @@ class EmbeddingService:
             try:
                 response = requests.post(
                     self.url,
-                    json={'model': 'models/text-embedding-004', 'content': {'parts': [{'text': text}]}},
-                    timeout=20
+                    json={
+                        'model': 'models/text-embedding-004', 
+                        'content': {'parts': [{'text': text}]}
+                    },
+                    timeout=30
                 )
+                
+                if response.status_code == 429 or response.status_code >= 500:
+                    # Quota exceeded or server error, rotate key
+                    logging.warning(f"API key {self.current_key_index} quota exceeded or error. Rotating...")
+                    self._rotate_key()
+                    if not self.url:
+                        return None
+                    continue
+                
                 response.raise_for_status() 
                 result = response.json()
                 embedding_values = result.get('embedding', {}).get('values')
 
-                # Logika untuk menyimpan ke cache
                 if embedding_values:
                     self.cache[text] = embedding_values
-                
-                return embedding_values
-                
-            except requests.exceptions.RequestException as e:
-                if isinstance(e, requests.exceptions.HTTPError) and 500 <= e.response.status_code < 600:
-                    wait_time = backoff_factor ** (i + 1)
-                    logging.warning(f"Gemini API error ({e.response.status_code}). Mencoba lagi dalam {wait_time} detik...")
-                    time.sleep(wait_time)
-                    continue 
+                    return embedding_values
                 else:
-                    logging.error(f"Gemini Embedding API Error (tidak bisa di-retry): {e}")
-                    return None 
+                    logging.error("No embedding values in response")
+                    return None
+                    
+            except requests.exceptions.RequestException as e:
+                logging.error(f"Embedding API request failed: {e}")
+                
+                if i < retries - 1:
+                    wait_time = backoff_factor ** (i + 1)
+                    logging.warning(f"Retrying in {wait_time} seconds...")
+                    time.sleep(wait_time)
+                    continue
+                else:
+                    logging.error(f"Failed after {retries} retries")
+                    return None
         
-        logging.error(f"Gagal mengambil embedding dari Gemini API setelah {retries} kali percobaan.")
         return None
 
 class GeminiService:
-    """
-    Service sederhana untuk berkomunikasi dengan Gemini API.
-    Mengelola API key rotation dan streaming response.
-    """
     def __init__(self):
-        self.api_keys = [key.strip() for key in os.getenv("GEMINI_API_KEYS", "").split(',') if key.strip()]
+        self.api_keys = self._load_keys_from_env()  # Tambahkan ini
         self.current_key_index = 0
         self.client = None
         
         if not self.api_keys:
-            logging.error("GEMINI_API_KEYS environment variable is not set or is empty.")
+            logging.error("No Gemini API keys found in environment variables")
             return
         
         self._initialize_client()
+
+    def _load_keys_from_env(self):
+        """Load API keys dari environment variables"""
+        keys = []
+        i = 1
+        while True:
+            env_key = f"GEMINI_API_KEY_{i}"
+            key_value = os.getenv(env_key)
+            if not key_value:
+                break
+            keys.append(key_value)
+            i += 1
+        
+        # Fallback ke format lama
+        if not keys:
+            old_keys_str = os.getenv('GEMINI_API_KEYS', '')
+            old_keys_list = [key.strip() for key in old_keys_str.split(',') if key.strip()]
+            keys.extend(old_keys_list)
+        
+        logging.info(f"Loaded {len(keys)} API keys for GeminiService")
+        return keys
+
+    def _get_current_key_config(self):
+        """Dapatkan config untuk key yang sedang digunakan"""
+        if self.current_key_index >= len(self.api_keys):
+            return None
+            
+        try:
+            # Mapping sederhana: KEY_1 -> index 0, KEY_2 -> index 1, dst
+            alias = f"KEY_{self.current_key_index + 1}"
+            config = GeminiApiKeyConfig.query.filter_by(key_alias=alias).first()
+            return config
+        except Exception as e:
+            logging.error(f"Error getting key config: {e}")
+            return None
 
     def _initialize_client(self):
         """Inisialisasi client dengan API key saat ini"""
         if self.current_key_index >= len(self.api_keys):
             self.client = None
-            logging.warning("All Gemini API keys have exceeded their quota.")
+            logging.warning("All Gemini API keys have been exhausted.")
             return
         
         try:
             current_key = self.api_keys[self.current_key_index]
             self.client = genai.Client(api_key=current_key)
+            
+            # Update last_used timestamp di database
+            key_config = self._get_current_key_config()
+            if key_config:
+                key_config.last_used = datetime.now(pytz.utc)
+                from .models import db
+                db.session.commit()
+                
             logging.info(f"Gemini Client initialized with API key index: {self.current_key_index}")
         except Exception as e:
             self.client = None
@@ -111,6 +200,11 @@ class GeminiService:
 
     def _rotate_key(self):
         """Rotasi ke API key berikutnya"""
+        # Mark current key as quota exceeded in database
+        current_key_config = self._get_current_key_config()
+        if current_key_config:
+            current_key_config.mark_quota_exceeded()
+        
         logging.warning(f"API key at index {self.current_key_index} exceeded quota. Rotating to next key.")
         self.current_key_index += 1
         self._initialize_client()
@@ -118,18 +212,12 @@ class GeminiService:
     def stream_generate_content(self, prompt: str):
         """
         Stream generate content dari Gemini API.
-        Yields raw chunk objects dari Gemini - biarkan caller yang handle formatting.
-        
-        Raises:
-            StopIteration: Ketika streaming selesai
-            Exception: Untuk error lainnya (quota, safety, dll)
         """
         while self.current_key_index < len(self.api_keys):
             if not self.client:
                 raise Exception("All API keys have exceeded their quota")
             
             try:
-                # Disable thinking untuk RAG - context sudah lengkap dari database
                 from google.genai import types
                 
                 response = self.client.models.generate_content_stream(
@@ -140,6 +228,11 @@ class GeminiService:
                     )
                 )
                 
+                # Tandai request sukses
+                key_config = self._get_current_key_config()
+                if key_config:
+                    key_config.mark_successful_request()
+                
                 for chunk in response:
                     if hasattr(chunk, 'text') and chunk.text:
                         yield chunk.text
@@ -147,6 +240,11 @@ class GeminiService:
                 return  # Streaming selesai sukses
                 
             except Exception as e:
+                # Tandai request gagal
+                key_config = self._get_current_key_config()
+                if key_config:
+                    key_config.mark_failed_request()
+                
                 error_str = str(e).lower()
                 
                 # Deteksi quota/429 error - rotate key dan retry
@@ -181,9 +279,20 @@ class GeminiService:
                     model='gemini-2.5-flash',
                     contents=prompt
                 )
+                
+                # Tandai request sukses
+                key_config = self._get_current_key_config()
+                if key_config:
+                    key_config.mark_successful_request()
+                
                 return response.text
                 
             except Exception as e:
+                # Tandai request gagal
+                key_config = self._get_current_key_config()
+                if key_config:
+                    key_config.mark_failed_request()
+                
                 error_str = str(e).lower()
                 
                 if "429" in str(e) or "quota" in error_str or "resource_exhausted" in error_str:
