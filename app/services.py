@@ -28,6 +28,14 @@ class EmbeddingService:
         
         self.cache = TTLCache(maxsize=1000, ttl=3600)
 
+    def reload_keys(self):
+        """Memuat ulang API keys dari environment dan mereset state."""
+        logging.info("Reloading keys for EmbeddingService...")
+        self.api_keys = self._load_keys_from_env()
+        self.current_key_index = 0
+        self._update_url()
+        logging.info(f"Successfully reloaded {len(self.api_keys)} keys.")
+
     def _load_keys_from_env(self):
         """Load API keys dari environment variables"""
         keys = []
@@ -129,8 +137,32 @@ class EmbeddingService:
         return None
 
 class GeminiService:
+    _instance = None
+
+    def __new__(cls, *args, **kwargs):
+        """
+        Metode __new__ mengontrol pembuatan instance.
+        Ini memastikan hanya satu instance yang pernah dibuat.
+        """
+        if not cls._instance:
+            cls._instance = super(GeminiService, cls).__new__(cls, *args, **kwargs)
+        return cls._instance
+    
     def __init__(self):
-        self.api_keys = self._load_keys_from_env()  # Tambahkan ini
+        """
+        Kita perlu mencegah __init__ berjalan berulang kali
+        setiap kali 'GeminiService()' dipanggil.
+        """
+        # Cek apakah instance ini sudah diinisialisasi
+        if hasattr(self, '_initialized'):
+            return  # Jika ya, jangan lakukan apa-apa
+        
+        # Tandai sebagai telah diinisialisasi
+        self._initialized = True 
+        
+        # --- (Kode __init__ asli Anda) ---
+        logging.info("Initializing GeminiService Singleton...") # Tambahkan log
+        self.api_keys = self._load_keys_from_env()
         self.current_key_index = 0
         self.client = None
         
@@ -140,17 +172,25 @@ class GeminiService:
         
         self._initialize_client()
 
+    def reload_keys(self):
+        """Memuat ulang API keys dari environment dan mereset state."""
+        logging.info("Reloading keys for GeminiService...")
+        self.api_keys = self._load_keys_from_env()
+        self.current_key_index = 0
+        self._initialize_client() # Inisialisasi ulang client dengan key baru
+        logging.info(f"Successfully reloaded {len(self.api_keys)} keys.")
+
     def _load_keys_from_env(self):
-        """Load API keys dari environment variables"""
+        """Load API keys dari environment variables dengan lebih robust."""
         keys = []
-        i = 1
-        while True:
-            env_key = f"GEMINI_API_KEY_{i}"
-            key_value = os.getenv(env_key)
-            if not key_value:
-                break
-            keys.append(key_value)
-            i += 1
+        # 1. Ambil semua environment variables yang cocok dengan pola
+        gemini_env_keys = {key: value for key, value in os.environ.items() if key.startswith('GEMINI_API_KEY_')}
+        
+        # 2. Urutkan berdasarkan nomor di akhir nama variabel (KEY_1, KEY_2, KEY_10)
+        sorted_keys = sorted(gemini_env_keys.items(), key=lambda item: int(item[0].split('_')[-1]))
+        
+        # 3. Ambil hanya nilainya (API key)
+        keys = [value for key, value in sorted_keys]
         
         # Fallback ke format lama
         if not keys:
@@ -168,7 +208,7 @@ class GeminiService:
             
         try:
             # Mapping sederhana: KEY_1 -> index 0, KEY_2 -> index 1, dst
-            alias = f"KEY_{self.current_key_index + 1}"
+            alias = f"{self.current_key_index + 1}"
             config = GeminiApiKeyConfig.query.filter_by(key_alias=alias).first()
             return config
         except Exception as e:
@@ -502,8 +542,22 @@ def process_and_save_pdf(pdf_path: str, job_id: int = None, progress_callback=No
                 message = f"Menganalisis Halaman {page_num}/{total_pages} (File: {original_filename})"
                 progress_callback(message=message)
 
-            raw_text = page.get_text("text")
-            is_table, reason = detector._detect_table_page(raw_text, page_num)
+            text_blocks = page.get_text("blocks")
+
+            raw_text = ""
+            is_table = False
+            reason = ""
+
+            if not text_blocks:
+                # Halaman ini kemungkinan besar hanya gambar. Jangan panggil get_text("text").
+                logging.warning(f"Halaman {page_num} di file '{original_filename}' tidak memiliki teks, dianggap sebagai gambar.")
+                raw_text = "" # Teks mentahnya kosong
+                is_table = True # Anggap sebagai tabel/gambar yang perlu direview
+                reason = "image_only_page" # Beri alasan baru
+            else:
+                # Halaman ini memiliki teks, lanjutkan proses normal.
+                raw_text = page.get_text("text")
+                is_table, reason = detector._detect_table_page(raw_text, page_num)
             
             # Hanya proses/simpan chunk yang bukan halaman exclude
             if reason == "excluded_page":

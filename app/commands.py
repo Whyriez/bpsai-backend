@@ -339,4 +339,48 @@ def register_commands(app):
             print("Tidak ada data DocumentChunk untuk disinkronkan.")
 
         print("\nSinkronisasi selesai!")
+
+    @app.cli.command('migrate-gemini-keys')
+    def migrate_gemini_keys():
+        """Migrate dari format lama ke format baru"""
+        from app.env_manager import EnvManager
+        from app.models import GeminiApiKeyConfig, db
+        import os
+        
+        env_manager = EnvManager()
+        
+        # Cek format lama
+        old_keys_str = os.getenv('GEMINI_API_KEYS', '')
+        if not old_keys_str:
+            print("Tidak ada keys dalam format lama")
+            return
+        
+        old_keys_list = [key.strip() for key in old_keys_str.split(',') if key.strip()]
+        print(f"Found {len(old_keys_list)} keys in old format")
+        
+        # Convert ke format baru
+        keys_config = {}
+        for i, key_value in enumerate(old_keys_list, 1):
+            alias = f"{i}"
+            keys_config[alias] = {'value': key_value}
+        
+        # Update .env file
+        success = env_manager.update_gemini_keys(keys_config)
+        if success:
+            print("Successfully migrated to new format")
+            
+            # Buat config di database
+            for alias in keys_config.keys():
+                if not GeminiApiKeyConfig.query.filter_by(key_alias=alias).first():
+                    config = GeminiApiKeyConfig(
+                        key_alias=alias,
+                        key_name=f"Migrated Key {alias.replace('KEY_', '')}",
+                        is_active=True
+                    )
+                    db.session.add(config)
+            
+            db.session.commit()
+            print("Database config created")
+        else:
+            print("Migration failed")
             

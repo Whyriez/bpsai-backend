@@ -3,7 +3,7 @@ from pgvector.sqlalchemy import Vector
 from sqlalchemy.orm import relationship
 from sqlalchemy import JSON, Enum, event, inspect, ForeignKey, Uuid, DateTime, Integer, Text, String
 from werkzeug.security import generate_password_hash, check_password_hash
-from datetime import datetime
+from datetime import datetime, timedelta  
 import uuid
 import enum
 import pytz
@@ -20,6 +20,75 @@ class JobStatus(enum.Enum):
     COMPLETED = "COMPLETED" # Semua item berhasil diproses
     FAILED = "FAILED"       # Terjadi error yang menghentikan pekerjaan
 
+
+class GeminiApiKeyConfig(db.Model):
+    __tablename__ = 'gemini_api_key_configs'
+    
+    id = db.Column(db.Integer, primary_key=True)
+    key_name = db.Column(db.String(50), nullable=False)
+    key_alias = db.Column(db.String(20), unique=True, nullable=False)  # KEY_1, KEY_2, dll
+    quota_exceeded = db.Column(db.Boolean, default=False)
+    quota_exceeded_at = db.Column(db.DateTime(timezone=True), nullable=True)
+    last_used = db.Column(db.DateTime, nullable=True)
+    total_requests = db.Column(db.Integer, default=0)
+    failed_requests = db.Column(db.Integer, default=0)
+    is_active = db.Column(db.Boolean, default=True)
+    created_at = db.Column(db.DateTime(timezone=True), default=lambda: datetime.now(pytz.utc))
+    updated_at = db.Column(db.DateTime(timezone=True), default=lambda: datetime.now(pytz.utc), onupdate=lambda: datetime.now(pytz.utc))
+
+    def get_quota_reset_time(self):
+        """Menghitung waktu reset quota (asumsi reset setiap 24 jam)"""
+        if not self.quota_exceeded_at:
+            return None
+        
+        reset_time = self.quota_exceeded_at + timedelta(hours=24)
+        return reset_time
+
+    def get_time_until_reset(self):
+        """Menghitung berapa lama lagi sampai reset"""
+        reset_time = self.get_quota_reset_time()
+        if not reset_time:
+            return None
+        
+        now = datetime.now(pytz.utc)
+        if reset_time > now:
+            time_left = reset_time - now
+            return {
+                'hours': time_left.seconds // 3600,
+                'minutes': (time_left.seconds % 3600) // 60,
+                'seconds': time_left.seconds % 60,
+                'total_seconds': time_left.total_seconds(),
+                'reset_time': reset_time.isoformat()
+            }
+        else:
+            # Reset time sudah lewat, reset status
+            self.quota_exceeded = False
+            self.quota_exceeded_at = None
+            db.session.commit()
+            return None
+
+    def mark_quota_exceeded(self):
+        """Menandai bahwa quota key ini telah exceeded"""
+        self.quota_exceeded = True
+        self.quota_exceeded_at = datetime.now(pytz.utc)
+        db.session.commit()
+
+    def mark_successful_request(self):
+        """Update stats untuk request sukses"""
+        self.total_requests += 1
+        self.last_used = datetime.now(pytz.utc)
+        db.session.commit()
+
+    def mark_failed_request(self):
+        """Update stats untuk request gagal"""
+        self.total_requests += 1
+        self.failed_requests += 1
+        self.last_used = datetime.now(pytz.utc)
+        db.session.commit()
+
+    def __repr__(self):
+        return f'<GeminiApiKeyConfig {self.key_name} ({self.key_alias})>'
+    
 class BatchJob(db.Model):
     __tablename__ = 'batch_jobs'
 

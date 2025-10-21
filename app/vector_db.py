@@ -1,28 +1,67 @@
 # app/vector_db.py
 import chromadb
+from chromadb.config import Settings
 import os
-
 from sqlalchemy import event
 from .models import BeritaBps, DocumentChunk
 import logging
 import numpy as np
 
-# Path untuk menyimpan data ChromaDB
-CHROMA_DATA_PATH = "chroma_data/"
+# ==========================================
+# UBAH DARI PersistentClient KE HttpClient
+# ==========================================
 
-# Inisialisasi client. Ini akan membuat folder jika belum ada.
-client = chromadb.PersistentClient(path=CHROMA_DATA_PATH)
+IS_PRODUCTION = os.getenv('ENVIRONMENT') == 'production'
 
-# Anda bisa membuat collection di sini atau secara dinamis
-# Collection mirip seperti tabel di SQL
-berita_collection = client.get_or_create_collection(name="berita_bps")
-document_collection = client.get_or_create_collection(name="document_chunks")
+if IS_PRODUCTION:
+    # Production: Gunakan HttpClient
+    CHROMA_HOST = os.getenv('CHROMA_HOST', 'localhost')
+    CHROMA_PORT = int(os.getenv('CHROMA_PORT', 8000))
+    
+    client = chromadb.HttpClient(
+        host=CHROMA_HOST,
+        port=CHROMA_PORT,
+        settings=Settings(anonymized_telemetry=False)
+    )
+    print(f"🌐 ChromaDB: Connected to service at {CHROMA_HOST}:{CHROMA_PORT}")
+else:
+    # Local Development: Gunakan PersistentClient
+    client = chromadb.PersistentClient(path="chroma_data/")
+    print("💻 ChromaDB: Running in embedded mode (local)")
+
+# Buat atau ambil collections
+berita_collection = None
+document_collection = None
 
 def get_collections():
+    """
+    Lazy initialization untuk collections.
+    Ini mencegah error jika ChromaDB belum ready saat import.
+    """
+    global berita_collection, document_collection
+    
+    if berita_collection is None or document_collection is None:
+        try:
+            berita_collection = client.get_or_create_collection(
+                name="berita_bps",
+                metadata={"hnsw:space": "cosine"}
+            )
+            document_collection = client.get_or_create_collection(
+                name="document_chunks",
+                metadata={"hnsw:space": "cosine"}
+            )
+            logging.info("ChromaDB collections initialized successfully")
+        except Exception as e:
+            logging.error(f"Failed to initialize ChromaDB collections: {e}")
+            raise
+    
     return berita_collection, document_collection
 
 
+# ==========================================
 # LISTENER FROM POSTGRES TO CHROMADB
+# ==========================================
+
 def sync_berita_to_chroma(mapper, connection, target):
     """
     Fungsi ini akan dijalankan setelah insert atau update pada BeritaBps.
@@ -34,11 +73,11 @@ def sync_berita_to_chroma(mapper, connection, target):
         return
 
     try:
-        berita_collection, _ = get_collections()
+        berita_col, _ = get_collections()
 
         embedding_list = target.embedding.tolist() if isinstance(target.embedding, np.ndarray) else target.embedding
 
-        berita_collection.upsert(
+        berita_col.upsert(
             ids=[str(target.id)],
             embeddings=[embedding_list],
             metadatas=[
@@ -60,11 +99,11 @@ def sync_chunk_to_chroma(mapper, connection, target):
         return
 
     try:
-        _, document_collection = get_collections()
+        _, document_col = get_collections()
 
         embedding_list = target.embedding.tolist() if isinstance(target.embedding, np.ndarray) else target.embedding
 
-        document_collection.upsert(
+        document_col.upsert(
             ids=[str(target.id)],
             embeddings=[embedding_list],
             metadatas=[
@@ -79,8 +118,8 @@ def delete_berita_from_chroma(mapper, connection, target):
     """ Dijalankan setelah data BeritaBps dihapus dari PostgreSQL. """
     logging.info(f"Listener 'delete_berita_from_chroma' terpicu untuk ID: {target.id}")
     try:
-        berita_collection, _ = get_collections()
-        berita_collection.delete(ids=[str(target.id)])
+        berita_col, _ = get_collections()
+        berita_col.delete(ids=[str(target.id)])
         logging.info(f"Berhasil delete BeritaBps ID {target.id} dari ChromaDB.")
     except Exception as e:
         logging.error(f"Gagal delete BeritaBps ID {target.id} dari ChromaDB: {e}")
@@ -89,8 +128,8 @@ def delete_chunk_from_chroma(mapper, connection, target):
     """ Dijalankan setelah data DocumentChunk dihapus dari PostgreSQL. """
     logging.info(f"Listener 'delete_chunk_from_chroma' terpicu untuk ID: {target.id}")
     try:
-        _, document_collection = get_collections()
-        document_collection.delete(ids=[str(target.id)])
+        _, document_col = get_collections()
+        document_col.delete(ids=[str(target.id)])
         logging.info(f"Berhasil delete DocumentChunk ID {target.id} dari ChromaDB.")
     except Exception as e:
         logging.error(f"Gagal delete DocumentChunk ID {target.id} dari ChromaDB: {e}")
@@ -108,4 +147,4 @@ def register_db_listeners():
     event.listen(DocumentChunk, 'after_update', sync_chunk_to_chroma)
     event.listen(DocumentChunk, 'after_delete', delete_chunk_from_chroma)
     
-    print("Database listeners untuk sinkronisasi ChromaDB berhasil didaftarkan.")
+    logging.info("Database listeners untuk sinkronisasi ChromaDB berhasil didaftarkan.")

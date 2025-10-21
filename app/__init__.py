@@ -46,6 +46,7 @@ def create_app():
     from .routes.dashboard import dashboard_bp
     from .routes.analytics import analytics_bp
     from .routes.document import document_bp
+    from .routes.api_keys import api_keys_bp
     
     app.register_blueprint(auth_bp)
     app.register_blueprint(chat_bp)
@@ -54,6 +55,7 @@ def create_app():
     app.register_blueprint(dashboard_bp)
     app.register_blueprint(analytics_bp)
     app.register_blueprint(document_bp)
+    app.register_blueprint(api_keys_bp)
 
     # Daftarkan perintah CLI
     # app.cli.add_command(cli)

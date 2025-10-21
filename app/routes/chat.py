@@ -83,7 +83,6 @@ def stream():
 
     db.session.expire_all()
 
-    # Simpan pertanyaan baru
     log = PromptLog(
         user_prompt=user_prompt,
         session_id=session_id,
@@ -95,97 +94,192 @@ def stream():
     db.session.commit()
     log_id = log.id
 
-    # Dapatkan app context SEBELUM generator dimulai
     app = current_app._get_current_object()
     
-    try:
-        def generate():
-            nonlocal log_id
-            model_response_buffer = ""
-            
+    def generate():
+        model_response_buffer = ""
+        
+        # --- PERUBAHAN UTAMA: SELURUH LOGIKA DIPINDAHKAN KE DALAM KONTEKS ---
+        with app.app_context():
             try:
-                # Semua operasi database harus dalam app context
-                with app.app_context():
-                    # Step 1: Analisis pertanyaan
-                    yield send_thinking_status("analyzing", "Menganalisis pertanyaan...")
-                    time.sleep(0.3)
-                    
-                    # Step 2: Ambil riwayat percakapan
-                    yield send_thinking_status("history", "Memuat riwayat percakapan...")
-                    recent_history_logs = PromptLog.query.filter(
-                        PromptLog.session_id == session_id,
-                        PromptLog.model_response.isnot(None),
-                        ~PromptLog.model_response.ilike('data:%'),
-                        ~PromptLog.model_response.ilike('error%')
-                    ).order_by(PromptLog.id.desc()).limit(4).all()
-                    recent_history_logs.reverse()
-                    history_context = format_conversation_history(recent_history_logs)
-                    
-                    # Step 3: Mencari data relevan
-                    yield send_thinking_status("searching", "Mencari data statistik relevan...")
-                    relevant_items = get_combined_relevant_results(user_prompt, limit=10)
-                    
-                    # Step 4: Ranking ulang hasil
-                    if relevant_items:
-                        yield send_thinking_status("ranking", f"Mengurutkan {len(relevant_items)} hasil pencarian...")
-                        items_to_rerank = [(item, dist) for item, dist in relevant_items]
-                        relevant_items = rerank_with_dss(items_to_rerank)
-                    
-                    # Step 5: Membangun konteks
-                    yield send_thinking_status("building", "Menyusun konteks jawaban...")
-                    context = build_context(relevant_items, log.extracted_years)
-                    final_prompt = build_final_prompt(context, user_prompt, history_context)
+                # Step 1-5: Analisis, History, Searching, Ranking, Building Context
+                yield send_thinking_status("analyzing", "Menganalisis pertanyaan...")
+                recent_history_logs = PromptLog.query.filter(
+                    PromptLog.session_id == session_id,
+                    PromptLog.model_response.isnot(None),
+                    ~PromptLog.model_response.ilike('data:%'),
+                    ~PromptLog.model_response.ilike('error%')
+                ).order_by(PromptLog.id.desc()).limit(4).all()
+                recent_history_logs.reverse()
+                history_context = format_conversation_history(recent_history_logs)
+                
+                yield send_thinking_status("searching", "Mencari data statistik relevan...")
+                relevant_items = get_combined_relevant_results(user_prompt, limit=10)
+                
+                if relevant_items:
+                    yield send_thinking_status("ranking", f"Mengurutkan {len(relevant_items)} hasil pencarian...")
+                    items_to_rerank = [(item, dist) for item, dist in relevant_items]
+                    relevant_items = rerank_with_dss(items_to_rerank)
+                
+                yield send_thinking_status("building", "Menyusun konteks jawaban...")
+                context = build_context(relevant_items, extract_years(user_prompt))
+                final_prompt = build_final_prompt(context, user_prompt, history_context)
 
-                    # Simpan retrieved_ids
-                    retrieved_ids = []
-                    for item in relevant_items:
-                        if isinstance(item, BeritaBps):
-                            retrieved_ids.append({'type': 'berita', 'id': item.id})
-                        elif isinstance(item, DocumentChunk):
-                            retrieved_ids.append({'type': 'document_chunk', 'id': str(item.id)})
-
-                    log.found_results = bool(relevant_items)
-                    log.retrieved_news_count = len(relevant_items)
-                    log.retrieved_news_ids = retrieved_ids
-                    log.final_prompt = final_prompt
+                # Update log dengan data pra-generasi
+                log_to_update = db.session.get(PromptLog, log_id)
+                if log_to_update:
+                    retrieved_ids = [{'type': 'berita', 'id': item.id} if isinstance(item, BeritaBps) else {'type': 'document_chunk', 'id': str(item.id)} for item in relevant_items]
+                    log_to_update.found_results = bool(relevant_items)
+                    log_to_update.retrieved_news_count = len(relevant_items)
+                    log_to_update.retrieved_news_ids = retrieved_ids
+                    log_to_update.final_prompt = final_prompt
                     db.session.commit()
 
                 # Step 6: Generate respons
                 yield send_thinking_status("generating", "Menyusun jawaban...")
-                time.sleep(0.3)
-                
-                # Setelah thinking selesai, kirim marker
                 yield f"data: {json.dumps({'thinking': False})}\n\n"
                 
-                # Mulai streaming respons AI
+                # Streaming dari Gemini Service (sekarang aman di dalam konteks)
                 for text_chunk in gemini_service.stream_generate_content(final_prompt):
                     model_response_buffer += text_chunk
                     sse_chunk = json.dumps({"text": text_chunk})
-                    try:
-                        yield f"data: {sse_chunk}\n\n"
-                    except GeneratorExit:
-                        app.logger.info(f"Client disconnected for session {session_id}")
-                        break
+                    yield f"data: {sse_chunk}\n\n"
                 
                 yield "data: [DONE]\n\n"
                 
             except Exception as e:
                 app.logger.error(f'Error in stream generation: {e}')
+                model_response_buffer = f"Error: {str(e)}"
                 error_msg = json.dumps({'error': {'message': str(e)}})
                 yield f"data: {error_msg}\n\n"
             finally:
-                update_log_after_streaming(app, log_id, model_response_buffer, start_time)
+                # --- Logika update dipindahkan ke sini ---
+                processing_time = int((time.time() - start_time) * 1000)
+                final_log_to_update = db.session.get(PromptLog, log_id)
+                if final_log_to_update:
+                    final_log_to_update.model_response = model_response_buffer if model_response_buffer else "[No Content]"
+                    final_log_to_update.processing_time_ms = processing_time
+                    db.session.commit()
+                    app.logger.info(f'Log updated successfully for log_id: {log_id}')
 
-        return Response(generate(), mimetype='text/event-stream')
+    # Return generator tanpa menangani exception di sini
+    return Response(generate(), mimetype='text/event-stream')
 
-    except Exception as e:
-        current_app.logger.error(f'Error processing chat stream: {e}')
-        log_to_update = db.session.get(PromptLog, log.id)
-        if log_to_update:
-            log_to_update.model_response = f"Error: {str(e)}"
-            log_to_update.processing_time_ms = int((time.time() - start_time) * 1000)
-            db.session.commit()
-        return Response(json.dumps({'error': 'Terjadi kesalahan internal.'}), status=500, mimetype='application/json')
+# @chat_bp.route('/stream', methods=['POST'])
+# def stream():
+#     start_time = time.time()
+#     data = request.json
+#     user_prompt = data.get('prompt')
+#     session_id = data.get('conversation_id')
+
+#     if not user_prompt or not session_id:
+#         return Response(json.dumps({'error': 'Prompt and conversation_id are required'}), status=400, mimetype='application/json')
+
+#     db.session.expire_all()
+
+#     # Simpan pertanyaan baru
+#     log = PromptLog(
+#         user_prompt=user_prompt,
+#         session_id=session_id,
+#         extracted_years=extract_years(user_prompt),
+#         extracted_keywords=extract_keywords(user_prompt),
+#         detected_intent=detect_intent(user_prompt)
+#     )
+#     db.session.add(log)
+#     db.session.commit()
+#     log_id = log.id
+
+#     # Dapatkan app context SEBELUM generator dimulai
+#     app = current_app._get_current_object()
+    
+#     try:
+#         def generate():
+#             nonlocal log_id
+#             model_response_buffer = ""
+            
+#             try:
+#                 # Semua operasi database harus dalam app context
+#                 with app.app_context():
+#                     # Step 1: Analisis pertanyaan
+#                     yield send_thinking_status("analyzing", "Menganalisis pertanyaan...")
+#                     time.sleep(0.3)
+                    
+#                     # Step 2: Ambil riwayat percakapan
+#                     yield send_thinking_status("history", "Memuat riwayat percakapan...")
+#                     recent_history_logs = PromptLog.query.filter(
+#                         PromptLog.session_id == session_id,
+#                         PromptLog.model_response.isnot(None),
+#                         ~PromptLog.model_response.ilike('data:%'),
+#                         ~PromptLog.model_response.ilike('error%')
+#                     ).order_by(PromptLog.id.desc()).limit(4).all()
+#                     recent_history_logs.reverse()
+#                     history_context = format_conversation_history(recent_history_logs)
+                    
+#                     # Step 3: Mencari data relevan
+#                     yield send_thinking_status("searching", "Mencari data statistik relevan...")
+#                     relevant_items = get_combined_relevant_results(user_prompt, limit=10)
+                    
+#                     # Step 4: Ranking ulang hasil
+#                     if relevant_items:
+#                         yield send_thinking_status("ranking", f"Mengurutkan {len(relevant_items)} hasil pencarian...")
+#                         items_to_rerank = [(item, dist) for item, dist in relevant_items]
+#                         relevant_items = rerank_with_dss(items_to_rerank)
+                    
+#                     # Step 5: Membangun konteks
+#                     yield send_thinking_status("building", "Menyusun konteks jawaban...")
+#                     context = build_context(relevant_items, log.extracted_years)
+#                     final_prompt = build_final_prompt(context, user_prompt, history_context)
+
+#                     # Simpan retrieved_ids
+#                     retrieved_ids = []
+#                     for item in relevant_items:
+#                         if isinstance(item, BeritaBps):
+#                             retrieved_ids.append({'type': 'berita', 'id': item.id})
+#                         elif isinstance(item, DocumentChunk):
+#                             retrieved_ids.append({'type': 'document_chunk', 'id': str(item.id)})
+
+#                     log.found_results = bool(relevant_items)
+#                     log.retrieved_news_count = len(relevant_items)
+#                     log.retrieved_news_ids = retrieved_ids
+#                     log.final_prompt = final_prompt
+#                     db.session.commit()
+
+#                 # Step 6: Generate respons
+#                 yield send_thinking_status("generating", "Menyusun jawaban...")
+#                 time.sleep(0.3)
+                
+#                 # Setelah thinking selesai, kirim marker
+#                 yield f"data: {json.dumps({'thinking': False})}\n\n"
+                
+#                 # Mulai streaming respons AI
+#                 for text_chunk in gemini_service.stream_generate_content(final_prompt):
+#                     model_response_buffer += text_chunk
+#                     sse_chunk = json.dumps({"text": text_chunk})
+#                     try:
+#                         yield f"data: {sse_chunk}\n\n"
+#                     except GeneratorExit:
+#                         app.logger.info(f"Client disconnected for session {session_id}")
+#                         break
+                
+#                 yield "data: [DONE]\n\n"
+                
+#             except Exception as e:
+#                 app.logger.error(f'Error in stream generation: {e}')
+#                 error_msg = json.dumps({'error': {'message': str(e)}})
+#                 yield f"data: {error_msg}\n\n"
+#             finally:
+#                 update_log_after_streaming(app, log_id, model_response_buffer, start_time)
+
+#         return Response(generate(), mimetype='text/event-stream')
+
+#     except Exception as e:
+#         current_app.logger.error(f'Error processing chat stream: {e}')
+#         log_to_update = db.session.get(PromptLog, log.id)
+#         if log_to_update:
+#             log_to_update.model_response = f"Error: {str(e)}"
+#             log_to_update.processing_time_ms = int((time.time() - start_time) * 1000)
+#             db.session.commit()
+#         return Response(json.dumps({'error': 'Terjadi kesalahan internal.'}), status=500, mimetype='application/json')
 
 def update_log_after_streaming(app, log_id, model_response, start_time):
     with app.app_context():
