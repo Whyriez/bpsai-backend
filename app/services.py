@@ -9,6 +9,8 @@ import fitz
 import re
 import time
 import hashlib
+from datetime import datetime  # ✅ TAMBAHKAN INI
+import pytz  # ✅ TAMBAHKAN INI
 from typing import List, Dict, Any
 from .models import db, PdfDocument, DocumentChunk, GeminiApiKeyConfig
 from flask import current_app
@@ -20,7 +22,6 @@ logging.basicConfig(level=logging.INFO)
 
 class EmbeddingService:
     def __init__(self):
-        # Gunakan method yang sama seperti GeminiService untuk load keys
         self.api_keys = self._load_keys_from_env()
         self.current_key_index = 0
         self.url = None
@@ -72,9 +73,11 @@ class EmbeddingService:
             self.current_key_index += 1
             self._update_url()
             logging.info(f"Rotated to API key index: {self.current_key_index}")
+            return True  # ✅ Berhasil rotate
         else:
             logging.error("No more API keys to rotate to")
             self.url = None
+            return False  # ✅ Tidak ada key lagi
 
     def generate(self, text: str) -> list | None:
         if not text:
@@ -89,79 +92,83 @@ class EmbeddingService:
             logging.error("Embedding generation failed: No API keys available")
             return None
         
-        retries = 3
+        max_key_attempts = len(self.api_keys)  # ✅ Coba semua keys
+        retries_per_key = 2  # ✅ Retry per key dikurangi
         backoff_factor = 2
         
-        for i in range(retries):
-            try:
-                response = requests.post(
-                    self.url,
-                    json={
-                        'model': 'models/text-embedding-004', 
-                        'content': {'parts': [{'text': text}]}
-                    },
-                    timeout=30
-                )
-                
-                if response.status_code == 429 or response.status_code >= 500:
-                    # Quota exceeded or server error, rotate key
-                    logging.warning(f"API key {self.current_key_index} quota exceeded or error. Rotating...")
-                    self._rotate_key()
-                    if not self.url:
-                        return None
-                    continue
-                
-                response.raise_for_status() 
-                result = response.json()
-                embedding_values = result.get('embedding', {}).get('values')
-
-                if embedding_values:
-                    self.cache[text] = embedding_values
-                    return embedding_values
-                else:
-                    logging.error("No embedding values in response")
-                    return None
+        for key_attempt in range(max_key_attempts):  # ✅ Loop untuk setiap key
+            for retry in range(retries_per_key):
+                try:
+                    response = requests.post(
+                        self.url,
+                        json={
+                            'model': 'models/text-embedding-004', 
+                            'content': {'parts': [{'text': text}]}
+                        },
+                        timeout=30
+                    )
                     
-            except requests.exceptions.RequestException as e:
-                logging.error(f"Embedding API request failed: {e}")
-                
-                if i < retries - 1:
-                    wait_time = backoff_factor ** (i + 1)
-                    logging.warning(f"Retrying in {wait_time} seconds...")
-                    time.sleep(wait_time)
-                    continue
-                else:
-                    logging.error(f"Failed after {retries} retries")
-                    return None
+                    if response.status_code == 429:
+                        logging.warning(f"API key {self.current_key_index} quota exceeded (429). Rotating...")
+                        if not self._rotate_key():
+                            return None  # Semua keys habis
+                        break  # Keluar dari retry loop, coba key berikutnya
+                    
+                    if response.status_code >= 500:
+                        logging.warning(f"Server error {response.status_code}. Retrying...")
+                        if retry < retries_per_key - 1:
+                            wait_time = backoff_factor ** (retry + 1)
+                            time.sleep(wait_time)
+                            continue
+                        else:
+                            # Coba key berikutnya
+                            if not self._rotate_key():
+                                return None
+                            break
+                    
+                    response.raise_for_status() 
+                    result = response.json()
+                    embedding_values = result.get('embedding', {}).get('values')
+
+                    if embedding_values:
+                        self.cache[text] = embedding_values
+                        return embedding_values
+                    else:
+                        logging.error("No embedding values in response")
+                        return None
+                        
+                except requests.exceptions.RequestException as e:
+                    logging.error(f"Embedding API request failed: {e}")
+                    
+                    if retry < retries_per_key - 1:
+                        wait_time = backoff_factor ** (retry + 1)
+                        logging.warning(f"Retrying in {wait_time} seconds...")
+                        time.sleep(wait_time)
+                    else:
+                        # Coba key berikutnya
+                        if not self._rotate_key():
+                            return None
+                        break
         
+        logging.error("All API keys exhausted for embedding generation")
         return None
+
 
 class GeminiService:
     _instance = None
 
     def __new__(cls, *args, **kwargs):
-        """
-        Metode __new__ mengontrol pembuatan instance.
-        Ini memastikan hanya satu instance yang pernah dibuat.
-        """
         if not cls._instance:
             cls._instance = super(GeminiService, cls).__new__(cls, *args, **kwargs)
         return cls._instance
     
     def __init__(self):
-        """
-        Kita perlu mencegah __init__ berjalan berulang kali
-        setiap kali 'GeminiService()' dipanggil.
-        """
-        # Cek apakah instance ini sudah diinisialisasi
         if hasattr(self, '_initialized'):
-            return  # Jika ya, jangan lakukan apa-apa
+            return
         
-        # Tandai sebagai telah diinisialisasi
         self._initialized = True 
         
-        # --- (Kode __init__ asli Anda) ---
-        logging.info("Initializing GeminiService Singleton...") # Tambahkan log
+        logging.info("Initializing GeminiService Singleton...")
         self.api_keys = self._load_keys_from_env()
         self.current_key_index = 0
         self.client = None
@@ -177,19 +184,14 @@ class GeminiService:
         logging.info("Reloading keys for GeminiService...")
         self.api_keys = self._load_keys_from_env()
         self.current_key_index = 0
-        self._initialize_client() # Inisialisasi ulang client dengan key baru
+        self._initialize_client()
         logging.info(f"Successfully reloaded {len(self.api_keys)} keys.")
 
     def _load_keys_from_env(self):
         """Load API keys dari environment variables dengan lebih robust."""
         keys = []
-        # 1. Ambil semua environment variables yang cocok dengan pola
         gemini_env_keys = {key: value for key, value in os.environ.items() if key.startswith('GEMINI_API_KEY_')}
-        
-        # 2. Urutkan berdasarkan nomor di akhir nama variabel (KEY_1, KEY_2, KEY_10)
         sorted_keys = sorted(gemini_env_keys.items(), key=lambda item: int(item[0].split('_')[-1]))
-        
-        # 3. Ambil hanya nilainya (API key)
         keys = [value for key, value in sorted_keys]
         
         # Fallback ke format lama
@@ -207,7 +209,6 @@ class GeminiService:
             return None
             
         try:
-            # Mapping sederhana: KEY_1 -> index 0, KEY_2 -> index 1, dst
             alias = f"{self.current_key_index + 1}"
             config = GeminiApiKeyConfig.query.filter_by(key_alias=alias).first()
             return config
@@ -220,46 +221,54 @@ class GeminiService:
         if self.current_key_index >= len(self.api_keys):
             self.client = None
             logging.warning("All Gemini API keys have been exhausted.")
-            return
+            return False  # ✅ Return boolean
         
         try:
             current_key = self.api_keys[self.current_key_index]
             self.client = genai.Client(api_key=current_key)
             
             # Update last_used timestamp di database
-            key_config = self._get_current_key_config()
-            if key_config:
-                key_config.last_used = datetime.now(pytz.utc)
-                from .models import db
-                db.session.commit()
+            try:
+                key_config = self._get_current_key_config()
+                if key_config:
+                    key_config.last_used = datetime.now(pytz.utc)  # ✅ Sekarang sudah di-import
+                    db.session.commit()
+            except Exception as db_error:
+                logging.warning(f"Could not update key config in database: {db_error}")
+                # Jangan gagalkan inisialisasi client hanya karena DB error
                 
             logging.info(f"Gemini Client initialized with API key index: {self.current_key_index}")
+            return True  # ✅ Sukses
+            
         except Exception as e:
             self.client = None
             logging.error(f"Failed to initialize Gemini Client with key index {self.current_key_index}: {e}")
+            return False  # ✅ Gagal
 
     def _rotate_key(self):
         """Rotasi ke API key berikutnya"""
-        # Mark current key as quota exceeded in database
-        current_key_config = self._get_current_key_config()
-        if current_key_config:
-            current_key_config.mark_quota_exceeded()
+        try:
+            current_key_config = self._get_current_key_config()
+            if current_key_config:
+                current_key_config.mark_quota_exceeded()
+        except Exception as e:
+            logging.warning(f"Could not mark quota exceeded in database: {e}")
         
         logging.warning(f"API key at index {self.current_key_index} exceeded quota. Rotating to next key.")
         self.current_key_index += 1
-        self._initialize_client()
+        
+        return self._initialize_client()  # ✅ Return hasil inisialisasi
 
     def stream_generate_content(self, prompt: str):
-        """
-        Stream generate content dari Gemini API.
-        """
-        while self.current_key_index < len(self.api_keys):
+        """Stream generate content dari Gemini API."""
+        max_attempts = len(self.api_keys)
+        
+        for attempt in range(max_attempts):
             if not self.client:
-                raise Exception("All API keys have exceeded their quota")
+                if not self._initialize_client():
+                    raise Exception("All API keys have exceeded their quota")
             
             try:
-                from google.genai import types
-                
                 response = self.client.models.generate_content_stream(
                     model='gemini-2.5-flash',
                     contents=prompt,
@@ -269,9 +278,12 @@ class GeminiService:
                 )
                 
                 # Tandai request sukses
-                key_config = self._get_current_key_config()
-                if key_config:
-                    key_config.mark_successful_request()
+                try:
+                    key_config = self._get_current_key_config()
+                    if key_config:
+                        key_config.mark_successful_request()
+                except Exception as db_error:
+                    logging.warning(f"Could not mark successful request: {db_error}")
                 
                 for chunk in response:
                     if hasattr(chunk, 'text') and chunk.text:
@@ -281,38 +293,41 @@ class GeminiService:
                 
             except Exception as e:
                 # Tandai request gagal
-                key_config = self._get_current_key_config()
-                if key_config:
-                    key_config.mark_failed_request()
+                try:
+                    key_config = self._get_current_key_config()
+                    if key_config:
+                        key_config.mark_failed_request()
+                except Exception as db_error:
+                    logging.warning(f"Could not mark failed request: {db_error}")
                 
                 error_str = str(e).lower()
                 
-                # Deteksi quota/429 error - rotate key dan retry
+                # Deteksi quota/429 error
                 if "429" in str(e) or "quota" in error_str or "resource_exhausted" in error_str:
                     logging.warning(f"Quota exceeded for key {self.current_key_index}: {e}")
-                    self._rotate_key()
+                    if not self._rotate_key():
+                        raise Exception("All API keys have exceeded their quota")
                     continue  # Retry dengan key baru
                 
                 # Deteksi safety filter
                 elif "safety" in error_str or "blocked" in error_str:
                     raise Exception("Content blocked due to safety settings")
                 
-                # Error lain - propagate ke caller
+                # Error lain
                 else:
                     logging.error(f"Gemini API error: {e}")
                     raise
         
-        # Semua keys habis
         raise Exception("All API keys have exceeded their quota")
 
     def generate_content(self, prompt: str) -> str | None:
-        """
-        Generate content tanpa streaming (synchronous).
-        Returns text atau None jika gagal.
-        """
-        while self.current_key_index < len(self.api_keys):
+        """Generate content tanpa streaming (synchronous)."""
+        max_attempts = len(self.api_keys)
+        
+        for attempt in range(max_attempts):
             if not self.client:
-                return None
+                if not self._initialize_client():
+                    return None
             
             try:
                 response = self.client.models.generate_content(
@@ -321,23 +336,31 @@ class GeminiService:
                 )
                 
                 # Tandai request sukses
-                key_config = self._get_current_key_config()
-                if key_config:
-                    key_config.mark_successful_request()
+                try:
+                    key_config = self._get_current_key_config()
+                    if key_config:
+                        key_config.mark_successful_request()
+                except Exception as db_error:
+                    logging.warning(f"Could not mark successful request: {db_error}")
                 
                 return response.text
                 
             except Exception as e:
                 # Tandai request gagal
-                key_config = self._get_current_key_config()
-                if key_config:
-                    key_config.mark_failed_request()
+                try:
+                    key_config = self._get_current_key_config()
+                    if key_config:
+                        key_config.mark_failed_request()
+                except Exception as db_error:
+                    logging.warning(f"Could not mark failed request: {db_error}")
                 
                 error_str = str(e).lower()
                 
                 if "429" in str(e) or "quota" in error_str or "resource_exhausted" in error_str:
-                    self._rotate_key()
-                    continue
+                    logging.warning(f"Quota exceeded for key {self.current_key_index}: {e}")
+                    if not self._rotate_key():
+                        return None
+                    continue  # Retry dengan key baru
                 else:
                     logging.error(f"Error generating content: {e}")
                     return None
@@ -347,7 +370,6 @@ class GeminiService:
 
 class RobustTableDetector:
     def __init__(self):
-        # Menggunakan konfigurasi Flask untuk path output, bukan hardcode
         self.output_dir = current_app.config['PDF_IMAGES_DIRECTORY']
         if not os.path.exists(self.output_dir):
             os.makedirs(self.output_dir)
@@ -357,11 +379,8 @@ class RobustTableDetector:
             document_specific_dir = os.path.join(self.output_dir, base_filename)
             os.makedirs(document_specific_dir, exist_ok=True)
 
-            # 2. Definisikan nama dan path file gambar di dalam subfolder
             image_filename = f"page_{page_num}.png"
             output_path = os.path.join(document_specific_dir, image_filename)
-
-            # 3. Path yang akan disimpan ke database (TANPA 'data/')
             web_accessible_path = f'pdf_images/{base_filename}/{image_filename}'
             
             if os.path.exists(output_path):
@@ -475,15 +494,11 @@ def process_and_save_pdf(pdf_path: str, job_id: int = None, progress_callback=No
     base_filename = os.path.splitext(os.path.basename(pdf_path))[0]
     original_filename = os.path.basename(pdf_path)
     
-    # <--- PERUBAHAN 1: LOGIKA GET-OR-CREATE DENGAN RESUME --->
     document = None
     start_page = 1
     
     try:
-        # Selalu buka file untuk menghitung hash dan total halaman
         file_hash = hashlib.sha256(open(pdf_path, "rb").read()).hexdigest()
-        
-        # Cek apakah dokumen sudah ada berdasarkan hash
         document = PdfDocument.query.filter_by(document_hash=file_hash).first()
 
         doc_for_pages = fitz.open(pdf_path)
@@ -491,48 +506,38 @@ def process_and_save_pdf(pdf_path: str, job_id: int = None, progress_callback=No
         doc_for_pages.close()
 
         if document:
-            # Dokumen sudah ada, cek halaman terakhir yang diproses
             last_chunk = DocumentChunk.query.filter_by(document_id=document.id)\
                 .order_by(DocumentChunk.page_number.desc()).first()
             
             if last_chunk:
-                # Jika semua halaman sudah diproses, lewati file ini
                 if last_chunk.page_number >= total_pages:
                     logging.info(f"Skipping '{original_filename}': Sudah selesai diproses.")
                     return {"status": "skipped", "filename": original_filename, "reason": "Dokumen sudah selesai diproses."}
                 
-                # Tentukan halaman awal untuk melanjutkan
                 start_page = last_chunk.page_number + 1
                 logging.info(f"Resuming '{original_filename}' from page {start_page}.")
-            # Jika dokumen ada tapi tidak ada chunk (kasus aneh), mulai dari awal
             else:
                  start_page = 1
         else:
-            # Dokumen baru, buat instance baru
             document = PdfDocument(
                 filename=original_filename,
                 total_pages=total_pages,
                 document_hash=file_hash,
                 doc_metadata={'source_path': pdf_path}
             )
-            # Jangan di-add ke session dulu, tunggu sampai chunk pertama siap
             
     except Exception as e:
         logging.error(f"Gagal saat inisialisasi pra-proses untuk {pdf_path}: {e}")
         return {"status": "error", "filename": original_filename, "reason": f"Initialization error: {str(e)}"}
 
-    # --- AKHIR PERUBAHAN 1 ---
-
     detector = RobustTableDetector()
     doc = fitz.open(pdf_path)
     
-    # Pastikan loop dimulai dari halaman yang benar
     for page_num, page in enumerate(doc, 1):
         if page_num < start_page:
             continue
 
         try:
-            # CEK STOP SIGNAL SEBELUM MEMPROSES SETIAP HALAMAN
             if job_id and check_job_should_stop(job_id):
                 doc.close()
                 logging.info(f"Proses dihentikan oleh pengguna sebelum halaman {page_num} pada file '{original_filename}'. Progress tersimpan.")
@@ -549,17 +554,14 @@ def process_and_save_pdf(pdf_path: str, job_id: int = None, progress_callback=No
             reason = ""
 
             if not text_blocks:
-                # Halaman ini kemungkinan besar hanya gambar. Jangan panggil get_text("text").
                 logging.warning(f"Halaman {page_num} di file '{original_filename}' tidak memiliki teks, dianggap sebagai gambar.")
-                raw_text = "" # Teks mentahnya kosong
-                is_table = True # Anggap sebagai tabel/gambar yang perlu direview
-                reason = "image_only_page" # Beri alasan baru
+                raw_text = ""
+                is_table = True
+                reason = "image_only_page"
             else:
-                # Halaman ini memiliki teks, lanjutkan proses normal.
                 raw_text = page.get_text("text")
                 is_table, reason = detector._detect_table_page(raw_text, page_num)
             
-            # Hanya proses/simpan chunk yang bukan halaman exclude
             if reason == "excluded_page":
                 continue
 
@@ -568,12 +570,9 @@ def process_and_save_pdf(pdf_path: str, job_id: int = None, progress_callback=No
             if is_table:
                 image_path = detector._save_page_screenshot(page, base_filename, page_num)
 
-            # <--- PERUBAHAN 2: COMMIT PER HALAMAN --->
-            
-            # Jika ini dokumen baru, sekarang saatnya menambahkannya ke DB
             if not document.id:
                 db.session.add(document)
-                db.session.flush() # flush untuk mendapatkan ID dokumen baru
+                db.session.flush()
 
             new_chunk = DocumentChunk(
                 document_id=document.id,
@@ -587,15 +586,12 @@ def process_and_save_pdf(pdf_path: str, job_id: int = None, progress_callback=No
                 }
             )
             db.session.add(new_chunk)
-            db.session.commit() # Simpan progress untuk halaman ini secara permanen
-            
-            # --- AKHIR PERUBAHAN 2 ---
+            db.session.commit()
 
         except Exception as e:
-            db.session.rollback() # Batalkan hanya transaksi halaman ini yang gagal
+            db.session.rollback()
             doc.close()
             logging.error(f"Gagal memproses halaman {page_num} dari '{pdf_path}': {e}")
-            # Hentikan proses untuk file ini karena terjadi error, tapi progress sebelumnya aman
             return {"status": "error", "filename": original_filename, "reason": f"Error on page {page_num}: {str(e)}"}
             
     doc.close()
