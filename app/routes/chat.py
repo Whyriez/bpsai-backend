@@ -12,7 +12,7 @@ from app.helpers import (
     extract_years, detect_intent, extract_keywords, build_context,
     build_final_prompt, expand_query_with_synonyms, BPS_ACRONYM_DICTIONARY,
     format_conversation_history,
-    rerank_with_dss
+    rerank_with_dss, expand_query_with_years
 )
 from sqlalchemy.orm import aliased
 
@@ -25,11 +25,19 @@ def send_thinking_status(status, detail=""):
     """Helper untuk mengirim status thinking ke client"""
     return f"data: {json.dumps({'thinking': True, 'status': status, 'detail': detail})}\n\n"
 
-def get_combined_relevant_results(user_prompt: str, limit: int = 15):
+def get_combined_relevant_results(user_prompt: str, requested_years: list = [], limit: int = 15):
     """
-    Melakukan vector search menggunakan ChromaDB, menggabungkan hasilnya.
+    PERBAIKAN: Tambahkan parameter requested_years dan tingkatkan strategi pencarian.
     """
+    # Expand dengan akronim
     expanded_prompt = expand_query_with_synonyms(user_prompt, BPS_ACRONYM_DICTIONARY)
+    
+    # PERBAIKAN: Jika ada tahun spesifik, tambahkan ke query
+    if requested_years:
+        expanded_prompt = expand_query_with_years(expanded_prompt, requested_years)
+        # PERBAIKAN: Tingkatkan limit jika mencari multiple years
+        limit = max(limit, len(requested_years) * 5)  # Minimal 5 hasil per tahun
+    
     current_app.logger.info(f"Original prompt: '{user_prompt}', Expanded to: '{expanded_prompt}'")
 
     prompt_embedding = embedding_service.generate(expanded_prompt)
@@ -58,7 +66,12 @@ def get_combined_relevant_results(user_prompt: str, limit: int = 15):
             distance = berita_results['distances'][0][i]
             berita_obj = db.session.get(BeritaBps, int(item_id)) 
             if berita_obj:
-                combined_results.append((berita_obj, distance))
+                # PERBAIKAN: Filter berdasarkan tahun yang diminta jika ada
+                if requested_years:
+                    if berita_obj.tanggal_rilis.year in requested_years:
+                        combined_results.append((berita_obj, distance))
+                else:
+                    combined_results.append((berita_obj, distance))
 
     if chunk_results['ids'][0]:
         for i, item_id in enumerate(chunk_results['ids'][0]):
@@ -66,6 +79,20 @@ def get_combined_relevant_results(user_prompt: str, limit: int = 15):
             chunk_obj = db.session.get(DocumentChunk, item_id)
             if chunk_obj:
                 combined_results.append((chunk_obj, distance))
+
+    # PERBAIKAN: Jika hasil masih kurang dan ada tahun spesifik, coba fallback query
+    if requested_years and len(combined_results) < len(requested_years):
+        current_app.logger.warning(f"Insufficient results for years {requested_years}, attempting fallback query")
+        # Fallback: Query langsung ke database berdasarkan tahun
+        for year in requested_years:
+            additional_news = BeritaBps.query.filter(
+                db.extract('year', BeritaBps.tanggal_rilis) == year
+            ).limit(3).all()
+            
+            for news in additional_news:
+                # Cek apakah sudah ada di results
+                if not any(item.id == news.id for item, _ in combined_results if isinstance(item, BeritaBps)):
+                    combined_results.append((news, 0.5))  # Distance moderat untuk fallback
 
     combined_results.sort(key=lambda x: x[1])
 
@@ -83,10 +110,13 @@ def stream():
 
     db.session.expire_all()
 
+    # PERBAIKAN: Extract years lebih awal
+    requested_years = extract_years(user_prompt)
+
     log = PromptLog(
         user_prompt=user_prompt,
         session_id=session_id,
-        extracted_years=extract_years(user_prompt),
+        extracted_years=requested_years,
         extracted_keywords=extract_keywords(user_prompt),
         detected_intent=detect_intent(user_prompt)
     )
@@ -99,7 +129,6 @@ def stream():
     def generate():
         model_response_buffer = ""
         
-        # --- PERUBAHAN UTAMA: SELURUH LOGIKA DIPINDAHKAN KE DALAM KONTEKS ---
         with app.app_context():
             try:
                 # Step 1-5: Analisis, History, Searching, Ranking, Building Context
@@ -113,17 +142,21 @@ def stream():
                 recent_history_logs.reverse()
                 history_context = format_conversation_history(recent_history_logs)
                 
-                yield send_thinking_status("searching", "Mencari data statistik relevan...")
-                relevant_items = get_combined_relevant_results(user_prompt, limit=10)
+                # PERBAIKAN: Pass requested_years ke fungsi search
+                yield send_thinking_status("searching", f"Mencari data untuk tahun {', '.join(map(str, requested_years)) if requested_years else 'terbaru'}...")
+                relevant_items = get_combined_relevant_results(user_prompt, requested_years=requested_years, limit=20)
                 
                 if relevant_items:
                     yield send_thinking_status("ranking", f"Mengurutkan {len(relevant_items)} hasil pencarian...")
                     items_to_rerank = [(item, dist) for item, dist in relevant_items]
-                    relevant_items = rerank_with_dss(items_to_rerank)
+                    # PERBAIKAN: Pass requested_years ke reranking
+                    relevant_items = rerank_with_dss(items_to_rerank, requested_years=requested_years)
                 
                 yield send_thinking_status("building", "Menyusun konteks jawaban...")
-                context = build_context(relevant_items, extract_years(user_prompt))
-                final_prompt = build_final_prompt(context, user_prompt, history_context)
+                # PERBAIKAN: Pass requested_years ke build_context
+                context = build_context(relevant_items, requested_years)
+                # PERBAIKAN: Pass requested_years ke build_final_prompt
+                final_prompt = build_final_prompt(context, user_prompt, history_context, requested_years)
 
                 # Update log dengan data pra-generasi
                 log_to_update = db.session.get(PromptLog, log_id)
@@ -139,7 +172,7 @@ def stream():
                 yield send_thinking_status("generating", "Menyusun jawaban...")
                 yield f"data: {json.dumps({'thinking': False})}\n\n"
                 
-                # Streaming dari Gemini Service (sekarang aman di dalam konteks)
+                # Streaming dari Gemini Service
                 for text_chunk in gemini_service.stream_generate_content(final_prompt):
                     model_response_buffer += text_chunk
                     sse_chunk = json.dumps({"text": text_chunk})
@@ -153,7 +186,6 @@ def stream():
                 error_msg = json.dumps({'error': {'message': str(e)}})
                 yield f"data: {error_msg}\n\n"
             finally:
-                # --- Logika update dipindahkan ke sini ---
                 processing_time = int((time.time() - start_time) * 1000)
                 final_log_to_update = db.session.get(PromptLog, log_id)
                 if final_log_to_update:
@@ -162,7 +194,6 @@ def stream():
                     db.session.commit()
                     app.logger.info(f'Log updated successfully for log_id: {log_id}')
 
-    # Return generator tanpa menangani exception di sini
     return Response(generate(), mimetype='text/event-stream')
 
 # @chat_bp.route('/stream', methods=['POST'])

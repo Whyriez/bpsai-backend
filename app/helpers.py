@@ -43,6 +43,18 @@ def extract_years(prompt: str) -> list:
         
     return sorted(list(years))
 
+def expand_query_with_years(prompt: str, years: list) -> str:
+    """
+    FUNGSI BARU: Memperluas query dengan menambahkan tahun-tahun yang diminta.
+    Ini membantu vector search menemukan dokumen untuk setiap tahun.
+    """
+    if not years:
+        return prompt
+    
+    # Tambahkan setiap tahun sebagai term tambahan
+    year_terms = ' '.join([str(year) for year in years])
+    return f"{prompt} {year_terms}"
+
 def extract_keywords(prompt: str) -> list:
     """Mengekstrak kata kunci dari prompt dengan menghapus stop words."""
     standard_stop_words = set(stopwords.words('indonesian'))
@@ -81,31 +93,25 @@ def build_context(relevant_items: list, requested_years: list = []) -> str:
     news_items = [item for item in relevant_items if isinstance(item, BeritaBps)]
     doc_chunks = [item for item in relevant_items if isinstance(item, DocumentChunk)]
 
-    # --- LOGIKA BARU YANG DISEMPURNAKAN ---
-    # Gunakan dictionary untuk menyimpan chunk yang sudah ditemukan agar tidak duplikat
+    # Logika untuk mengambil tabel lanjutan
     augmented_chunks_map = {chunk.id: chunk for chunk in doc_chunks}
     continuation_pattern = re.compile(r'(lanjutan tabel|tabel.*lanjutan|continued table)', re.IGNORECASE)
 
-    # Buat salinan daftar awal untuk diiterasi
     doc_ids_to_check = {chunk.document_id for chunk in doc_chunks}
 
     if doc_ids_to_check:
-        # Ambil SEMUA chunk dari dokumen yang relevan dalam SATU KALI query
         all_related_chunks = DocumentChunk.query.filter(
             DocumentChunk.document_id.in_(doc_ids_to_check)
         ).all()
 
-        # Buat map untuk akses cepat: {document_id: {page_num: chunk_obj}}
         chunks_by_doc_page = {}
         for c in all_related_chunks:
             if c.document_id not in chunks_by_doc_page:
                 chunks_by_doc_page[c.document_id] = {}
             chunks_by_doc_page[c.document_id][c.page_number] = c
 
-        # Sekarang lakukan logika pencarian di memori, BUKAN di database
         chunks_to_check = list(doc_chunks)
         for chunk in chunks_to_check:
-            # 1. Pencarian ke belakang (in-memory)
             if continuation_pattern.search(chunk.chunk_content):
                 current_page_num = chunk.page_number
                 while True:
@@ -121,7 +127,6 @@ def build_context(relevant_items: list, requested_years: list = []) -> str:
                     else:
                         break
 
-            # 2. Pencarian ke depan (in-memory)
             current_page_num = chunk.page_number
             while True:
                 next_page_num = current_page_num + 1
@@ -135,19 +140,18 @@ def build_context(relevant_items: list, requested_years: list = []) -> str:
                 current_page_num = next_page_num
 
     doc_chunks = list(augmented_chunks_map.values())
-    # --- AKHIR DARI LOGIKA BARU ---
 
     context = ""
     
     if news_items:
         context += "--- KONTEKS DARI BERITA RESMI BPS ---\n\n"
-        # ... (sisa kode untuk format berita tidak berubah)
         news_by_year = {}
         for news in news_items:
             year = news.tanggal_rilis.year
             if year not in news_by_year:
                 news_by_year[year] = []
             news_by_year[year].append(news)
+        
         for year in sorted(news_by_year.keys(), reverse=True):
             context += f"### Berita Tahun {year} ###\n"
             for news in news_by_year[year]:
@@ -175,11 +179,14 @@ def build_context(relevant_items: list, requested_years: list = []) -> str:
                 context += f"{chunk.chunk_content}\n\n"
 
     if requested_years:
-        # ... (sisa kode untuk format tahun tidak berubah)
         found_years_news = {n.tanggal_rilis.year for n in news_items}
         missing_years = sorted(list(set(requested_years) - found_years_news))
         if missing_years:
-            context += f"CATATAN UNTUK AI: Data berita untuk tahun {', '.join(map(str, missing_years))} tidak ditemukan. Anda wajib memberitahu pengguna.\n\n"
+            # PERBAIKAN: Tambahkan penekanan yang lebih kuat
+            context += f"\n⚠️ PENTING - DATA TIDAK LENGKAP ⚠️\n"
+            context += f"User meminta data untuk tahun: {', '.join(map(str, requested_years))}\n"
+            context += f"Data yang TIDAK ditemukan untuk tahun: {', '.join(map(str, missing_years))}\n"
+            context += f"WAJIB memberitahu user secara eksplisit bahwa data untuk tahun {', '.join(map(str, missing_years))} tidak tersedia dalam database.\n\n"
 
     context += "--- AKHIR DARI KONTEKS ---\n\n"
     return context
@@ -193,7 +200,6 @@ def format_conversation_history(history: list[PromptLog]) -> str:
     if not history:
         return ""
 
-    # Filter log yang valid
     valid_logs = [
         log for log in history
         if (log.user_prompt and log.model_response and
@@ -206,9 +212,7 @@ def format_conversation_history(history: list[PromptLog]) -> str:
 
     formatted_history = ""
 
-    # **FIX: Untuk riwayat dengan beberapa interaksi**
     if len(valid_logs) >= 2:
-        # Ambil 2 interaksi terakhir dari riwayat yang ada
         recent_interactions = valid_logs[-2:]
         
         formatted_history += "### Dua Interaksi Terakhir ###\n\n"
@@ -218,7 +222,6 @@ def format_conversation_history(history: list[PromptLog]) -> str:
             formatted_history += f"**JAWABAN:** {log.model_response}\n\n"
     
     else:
-        # Hanya ada 1 interaksi dalam riwayat
         single_log = valid_logs[-1]
         formatted_history += "### Interaksi Terakhir ###\n\n"
         formatted_history += f"**PERTANYAAN:** {single_log.user_prompt}\n"
@@ -226,17 +229,39 @@ def format_conversation_history(history: list[PromptLog]) -> str:
 
     return formatted_history
 
-def build_final_prompt(context: str, user_prompt: str, history_context: str = "") -> str:
+def build_final_prompt(context: str, user_prompt: str, history_context: str = "", requested_years: list = []) -> str:
     """
-    Membangun prompt final yang menggabungkan format penyajian data yang detail 
-    dengan kemampuan untuk menangani pertanyaan riwayat dan menyertakan link sumber.
+    PERBAIKAN: Tambahkan parameter requested_years dan buat instruksi lebih eksplisit
+    tentang menampilkan data untuk SEMUA tahun yang diminta.
     """
     full_context = history_context + context if history_context else context
+    
+    # Buat instruksi khusus jika ada tahun yang diminta
+    year_instruction = ""
+    if requested_years:
+        year_instruction = f"""
+### ⚠️ INSTRUKSI KHUSUS RENTANG TAHUN ⚠️
+User meminta data untuk tahun: **{', '.join(map(str, requested_years))}**
+
+WAJIB DIIKUTI:
+1. Cari dan tampilkan data untuk SETIAP tahun yang diminta: {', '.join(map(str, requested_years))}
+2. Jika data untuk tahun tertentu tidak ada dalam konteks, WAJIB sebutkan tahun mana yang tidak tersedia
+3. Format jawaban harus mengelompokkan data per tahun dengan jelas
+4. Jangan hanya menampilkan data tahun terbaru saja
+
+Contoh format yang benar:
+**Data NTP Tahun 2020**: [data atau "Data tidak tersedia"]
+**Data NTP Tahun 2021**: [data atau "Data tidak tersedia"]
+**Data NTP Tahun 2022**: [data atau "Data tidak tersedia"]
+dst...
+"""
 
     return f"""
 Kamu adalah Asisten AI Data dari BPS Provinsi Gorontalo. Misi utama kamu adalah menyajikan data secara akurat dan dalam format yang paling mudah dibaca.
 
 {history_context}
+
+{year_instruction}
 
 --- Konteks Data Relevan (Sumber Utama Jawaban) ---
 {context}
@@ -283,7 +308,7 @@ Kamu adalah Asisten AI Data dari BPS Provinsi Gorontalo. Misi utama kamu adalah 
 #### B6. FOKUS PADA KONTEKS:
 * Jawabanmu **HARUS** didasarkan **HANYA** pada "Konteks Data Relevan".
 
-#### B7. SERTAKAN LINK SUMBER (BARU & PENTING):
+#### B7. SERTAKAN LINK SUMBER (PENTING):
 * Setelah bagian "Catatan Tambahan", jika 'Konteks Data' menyediakan **Link** untuk dokumen atau berita yang digunakan, kamu **WAJIB** menampilkannya di bawah judul **"Sumber Digital"**.
 * **Contoh Format:** `Sumber Digital: [provinsi-gorontalo-dalam-angka-2025.pdf](http://path/to/document.pdf)`
 """
@@ -340,28 +365,37 @@ Kamu adalah Asisten AI Data dari BPS Provinsi Gorontalo. Misi utama kamu adalah 
 def normalize(value, min_val, max_val):
     """Normalisasi nilai ke rentang 0-1."""
     if max_val == min_val:
-        return 0.5 # Hindari pembagian dengan nol
+        return 0.5
     return (value - min_val) / (max_val - min_val)
 
-def rerank_with_dss(results_with_distance: list):
+def rerank_with_dss(results_with_distance: list, requested_years: list = []):
     """
-    Menyusun ulang peringkat hasil pencarian menggunakan metode Weighted Scoring.
-    Inputnya adalah list tuple [(item, distance), ...].
+    PERBAIKAN: Menyesuaikan ranking agar tidak terlalu bias ke data terbaru
+    saat user meminta rentang tahun tertentu.
     """
     if not results_with_distance:
         return []
 
-    # Definisikan bobot kriteria
-    weights = {
-        'relevance': 0.40,
-        'feedback': 0.35,
-        'recency': 0.15,
-        'content_type': 0.10
-    }
+    # PERBAIKAN: Sesuaikan bobot berdasarkan konteks
+    if requested_years:
+        # Jika ada tahun spesifik diminta, kurangi bobot recency
+        weights = {
+            'relevance': 0.50,    # Tingkatkan relevance
+            'feedback': 0.30,
+            'recency': 0.05,      # Kurangi drastis recency bias
+            'content_type': 0.15
+        }
+    else:
+        # Gunakan bobot normal untuk query umum
+        weights = {
+            'relevance': 0.40,
+            'feedback': 0.35,
+            'recency': 0.15,
+            'content_type': 0.10
+        }
 
     scored_items = []
     
-    # Ekstrak semua ID untuk query feedback score yang efisien
     berita_ids = [str(item.id) for item, dist in results_with_distance if isinstance(item, BeritaBps)]
     chunk_ids = [str(item.id) for item, dist in results_with_distance if isinstance(item, DocumentChunk)]
 
@@ -370,39 +404,41 @@ def rerank_with_dss(results_with_distance: list):
         ((DocumentFeedbackScore.entity_type == 'document_chunk') & (DocumentFeedbackScore.entity_id.in_(chunk_ids)))
     ).all()
     
-    # Ubah ke dictionary untuk akses cepat
     feedback_map = {f"{fs.entity_type}-{fs.entity_id}": fs.score for fs in feedback_scores_db}
 
     for item, distance in results_with_distance:
         scores = {}
         
-        # 1. Skor Relevansi (semakin kecil distance, semakin bagus)
+        # 1. Skor Relevansi
         scores['relevance'] = 1 - distance 
 
         # 2. Skor Feedback
         entity_type = 'berita_bps' if isinstance(item, BeritaBps) else 'document_chunk'
         entity_id = str(item.id)
-        scores['feedback'] = feedback_map.get(f"{entity_type}-{entity_id}", 0.5) # Default 0.5 (netral)
+        scores['feedback'] = feedback_map.get(f"{entity_type}-{entity_id}", 0.5)
 
-        # 3. Skor Keterbaruan
+        # 3. Skor Keterbaruan - PERBAIKAN
         recency_date = None
         if isinstance(item, BeritaBps):
             recency_date = item.tanggal_rilis
+            # PERBAIKAN: Jika tahun berita sesuai dengan yang diminta, berikan bonus
+            if requested_years and recency_date.year in requested_years:
+                scores['recency'] = 1.0  # Nilai maksimal
+            else:
+                days_ago = (datetime.utcnow().date() - recency_date).days
+                scores['recency'] = max(0, 1 - (days_ago / 365))
         elif isinstance(item, DocumentChunk):
-            recency_date = item.created_at.date() # Ambil tanggalnya saja
-        
-        if recency_date:
+            recency_date = item.created_at.date()
             days_ago = (datetime.utcnow().date() - recency_date).days
-            # Skor menurun setelah 1 tahun (365 hari)
-            scores['recency'] = max(0, 1 - (days_ago / 365)) 
+            scores['recency'] = max(0, 1 - (days_ago / 365))
         else:
             scores['recency'] = 0.5
 
         # 4. Skor Tipe Konten
         if isinstance(item, DocumentChunk) and item.chunk_metadata.get('type') == 'table':
-            scores['content_type'] = 1.0 # Nilai tertinggi untuk tabel
+            scores['content_type'] = 1.0
         else:
-            scores['content_type'] = 0.5 # Nilai standar
+            scores['content_type'] = 0.5
         
         # Kalkulasi skor akhir
         final_score = (scores['relevance'] * weights['relevance'] +
@@ -412,8 +448,6 @@ def rerank_with_dss(results_with_distance: list):
         
         scored_items.append({'item': item, 'final_score': final_score, 'details': scores})
 
-    # Urutkan berdasarkan skor akhir tertinggi
     sorted_items = sorted(scored_items, key=lambda x: x['final_score'], reverse=True)
     
-    # Kembalikan hanya objek item yang sudah terurut
     return [x['item'] for x in sorted_items]
