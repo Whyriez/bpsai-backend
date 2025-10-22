@@ -221,29 +221,34 @@ class GeminiService:
         if self.current_key_index >= len(self.api_keys):
             self.client = None
             logging.warning("All Gemini API keys have been exhausted.")
-            return False  # ✅ Return boolean
+            return False
         
         try:
+            # Cek dan reset quota status untuk key yang akan digunakan
+            key_config = self._get_current_key_config()
+            if key_config:
+                key_config.check_and_reset_quota()  # <- TAMBAHKAN INI
+                
+                # Skip key yang masih quota exceeded
+                if key_config.quota_exceeded:
+                    logging.warning(f"API key {self.current_key_index} still has quota exceeded. Skipping...")
+                    return False
+            
             current_key = self.api_keys[self.current_key_index]
             self.client = genai.Client(api_key=current_key)
             
             # Update last_used timestamp di database
-            try:
-                key_config = self._get_current_key_config()
-                if key_config:
-                    key_config.last_used = datetime.now(pytz.utc)  # ✅ Sekarang sudah di-import
-                    db.session.commit()
-            except Exception as db_error:
-                logging.warning(f"Could not update key config in database: {db_error}")
-                # Jangan gagalkan inisialisasi client hanya karena DB error
+            if key_config:
+                key_config.last_used = datetime.now(pytz.utc)
+                db.session.commit()
                 
             logging.info(f"Gemini Client initialized with API key index: {self.current_key_index}")
-            return True  # ✅ Sukses
+            return True
             
         except Exception as e:
             self.client = None
             logging.error(f"Failed to initialize Gemini Client with key index {self.current_key_index}: {e}")
-            return False  # ✅ Gagal
+            return False
 
     def _rotate_key(self):
         """Rotasi ke API key berikutnya"""

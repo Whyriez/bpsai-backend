@@ -5,7 +5,7 @@ import re
 import pandas as pd
 import io
 from flask import Blueprint, request, Response, session, current_app, jsonify, send_file
-from app.models import db, BeritaBps, DocumentChunk, PromptLog, Feedback 
+from app.models import db, BeritaBps, DocumentChunk, PromptLog, Feedback, PdfDocument
 from app.services import EmbeddingService, GeminiService
 from app.vector_db import get_collections
 from app.helpers import (
@@ -25,13 +25,19 @@ def send_thinking_status(status, detail=""):
     """Helper untuk mengirim status thinking ke client"""
     return f"data: {json.dumps({'thinking': True, 'status': status, 'detail': detail})}\n\n"
 
-def get_combined_relevant_results(user_prompt: str, requested_years: list = [], limit: int = 15):
+def get_combined_relevant_results(user_prompt: str, requested_years: list = [], specific_document: str = None, limit: int = 15):
     """
     PERBAIKAN: Tambahkan parameter requested_years dan tingkatkan strategi pencarian.
     """
     # Expand dengan akronim
     expanded_prompt = expand_query_with_synonyms(user_prompt, BPS_ACRONYM_DICTIONARY)
     
+    if not specific_document:
+        doc_pattern = re.search(r'(?:dokumen|file|pdf)\s+([^\s,]+(?:\s+\w+)*\s+\d{4})', 
+                               user_prompt, re.IGNORECASE)
+        if doc_pattern:
+            specific_document = doc_pattern.group(1)
+
     # PERBAIKAN: Jika ada tahun spesifik, tambahkan ke query
     if requested_years:
         expanded_prompt = expand_query_with_years(expanded_prompt, requested_years)
@@ -39,6 +45,8 @@ def get_combined_relevant_results(user_prompt: str, requested_years: list = [], 
         limit = max(limit, len(requested_years) * 5)  # Minimal 5 hasil per tahun
     
     current_app.logger.info(f"Original prompt: '{user_prompt}', Expanded to: '{expanded_prompt}'")
+    if specific_document:
+        current_app.logger.info(f"Filtering for specific document: {specific_document}")
 
     prompt_embedding = embedding_service.generate(expanded_prompt)
     if not prompt_embedding:
@@ -55,7 +63,7 @@ def get_combined_relevant_results(user_prompt: str, requested_years: list = [], 
     # Query ke collection DocumentChunk
     chunk_results = document_collection.query(
         query_embeddings=[prompt_embedding],
-        n_results=limit
+        n_results=limit * 2  # Ambil lebih banyak untuk difilter
     )
 
     # Gabungkan dan proses hasil dari ChromaDB
@@ -66,7 +74,6 @@ def get_combined_relevant_results(user_prompt: str, requested_years: list = [], 
             distance = berita_results['distances'][0][i]
             berita_obj = db.session.get(BeritaBps, int(item_id)) 
             if berita_obj:
-                # PERBAIKAN: Filter berdasarkan tahun yang diminta jika ada
                 if requested_years:
                     if berita_obj.tanggal_rilis.year in requested_years:
                         combined_results.append((berita_obj, distance))
@@ -77,8 +84,30 @@ def get_combined_relevant_results(user_prompt: str, requested_years: list = [], 
         for i, item_id in enumerate(chunk_results['ids'][0]):
             distance = chunk_results['distances'][0][i]
             chunk_obj = db.session.get(DocumentChunk, item_id)
-            if chunk_obj:
-                combined_results.append((chunk_obj, distance))
+            if chunk_obj and chunk_obj.document:
+                # FILTER BERDASARKAN NAMA DOKUMEN JIKA DIMINTA
+                if specific_document:
+                    # Normalisasi nama untuk matching yang lebih fleksibel
+                    doc_filename = chunk_obj.document.filename.lower().replace('.pdf', '')
+                    search_term = specific_document.lower().replace('.pdf', '')
+                    
+                    # Cek apakah nama dokumen mengandung search term
+                    if search_term in doc_filename:
+                        combined_results.append((chunk_obj, distance))
+                        current_app.logger.debug(f"Matched: {chunk_obj.document.filename}")
+                else:
+                    combined_results.append((chunk_obj, distance))
+
+    if specific_document and len(combined_results) == 0:
+        current_app.logger.warning(f"No results found for document '{specific_document}', trying broader search")
+        # Coba query langsung ke database
+        from sqlalchemy import or_, func
+        direct_chunks = DocumentChunk.query.join(PdfDocument).filter(
+            func.lower(PdfDocument.filename).contains(specific_document.lower())
+        ).limit(10).all()
+        
+        for chunk in direct_chunks:
+            combined_results.append((chunk, 0.7))
 
     # PERBAIKAN: Jika hasil masih kurang dan ada tahun spesifik, coba fallback query
     if requested_years and len(combined_results) < len(requested_years):
@@ -110,6 +139,13 @@ def stream():
 
     db.session.expire_all()
 
+    specific_doc = None
+    doc_pattern = re.search(r'(?:dokumen|file|pdf)\s+([^\s,]+(?:\s+\w+)*\s+\d{4})', 
+                           user_prompt, re.IGNORECASE)
+    if doc_pattern:
+        specific_doc = doc_pattern.group(1)
+        current_app.logger.info(f"Detected specific document request: {specific_doc}")
+
     # PERBAIKAN: Extract years lebih awal
     requested_years = extract_years(user_prompt)
 
@@ -132,7 +168,9 @@ def stream():
         with app.app_context():
             try:
                 # Step 1-5: Analisis, History, Searching, Ranking, Building Context
-                yield send_thinking_status("analyzing", "Menganalisis pertanyaan...")
+                yield send_thinking_status("searching", 
+                    f"Mencari data {'di ' + specific_doc if specific_doc else ''} "
+                    f"untuk tahun {', '.join(map(str, requested_years)) if requested_years else 'terbaru'}...")
                 recent_history_logs = PromptLog.query.filter(
                     PromptLog.session_id == session_id,
                     PromptLog.model_response.isnot(None),
@@ -144,7 +182,12 @@ def stream():
                 
                 # PERBAIKAN: Pass requested_years ke fungsi search
                 yield send_thinking_status("searching", f"Mencari data untuk tahun {', '.join(map(str, requested_years)) if requested_years else 'terbaru'}...")
-                relevant_items = get_combined_relevant_results(user_prompt, requested_years=requested_years, limit=20)
+                relevant_items = get_combined_relevant_results(
+                    user_prompt, 
+                    requested_years=requested_years, 
+                    specific_document=specific_doc,  # <--- TAMBAHAN INI
+                    limit=20
+                )
                 
                 if relevant_items:
                     yield send_thinking_status("ranking", f"Mengurutkan {len(relevant_items)} hasil pencarian...")

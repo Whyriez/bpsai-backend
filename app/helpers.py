@@ -162,6 +162,8 @@ def build_context(relevant_items: list, requested_years: list = []) -> str:
 
     if doc_chunks:
         context += "--- KONTEKS DARI DOKUMEN PDF ---\n\n"
+        
+        # PERBAIKAN: Kelompokkan dan urutkan berdasarkan tahun dari filename
         chunks_by_doc = {}
         for chunk in doc_chunks:
             if chunk.document:
@@ -169,11 +171,26 @@ def build_context(relevant_items: list, requested_years: list = []) -> str:
                 if doc_key not in chunks_by_doc:
                     chunks_by_doc[doc_key] = []
                 chunks_by_doc[doc_key].append(chunk)
-
-        for (filename, link), chunks in chunks_by_doc.items():
-            context += f"### Dokumen: {filename} ###\n"
+        
+        # Fungsi untuk extract tahun dari filename
+        def extract_year_from_filename(filename):
+            """Extract 4-digit year dari filename, return 9999 jika tidak ada"""
+            match = re.search(r'\b(20\d{2}|19\d{2})\b', filename)
+            return int(match.group(1)) if match else 9999
+        
+        # URUTKAN dokumen berdasarkan tahun (ascending)
+        sorted_docs = sorted(chunks_by_doc.items(), 
+                           key=lambda x: extract_year_from_filename(x[0][0]))
+        
+        for (filename, link), chunks in sorted_docs:
+            year = extract_year_from_filename(filename)
+            year_str = f" (Tahun {year})" if year != 9999 else ""
+            
+            context += f"### Dokumen: {filename}{year_str} ###\n"
             if link:
                 context += f"**Link:** {link}\n"
+            
+            # URUTKAN chunks berdasarkan page_number
             for chunk in sorted(chunks, key=lambda c: c.page_number):
                 context += f"**Halaman {chunk.page_number}:**\n"
                 context += f"{chunk.chunk_content}\n\n"

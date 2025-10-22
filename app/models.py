@@ -46,6 +46,9 @@ class GeminiApiKeyConfig(db.Model):
 
     def get_time_until_reset(self):
         """Menghitung berapa lama lagi sampai reset"""
+        # Cek dan reset dulu jika sudah waktunya
+        self.check_and_reset_quota()
+        
         reset_time = self.get_quota_reset_time()
         if not reset_time:
             return None
@@ -60,12 +63,18 @@ class GeminiApiKeyConfig(db.Model):
                 'total_seconds': time_left.total_seconds(),
                 'reset_time': reset_time.isoformat()
             }
-        else:
-            # Reset time sudah lewat, reset status
-            self.quota_exceeded = False
-            self.quota_exceeded_at = None
-            db.session.commit()
-            return None
+        return None
+    
+    def check_and_reset_quota(self):
+        """Cek dan reset quota status jika sudah waktunya"""
+        if self.quota_exceeded and self.quota_exceeded_at:
+            reset_time = self.get_quota_reset_time()
+            if reset_time and reset_time <= datetime.now(pytz.utc):
+                self.quota_exceeded = False
+                self.quota_exceeded_at = None
+                db.session.commit()
+                return True  # Berhasil di-reset
+        return False  # Tidak perlu reset
 
     def mark_quota_exceeded(self):
         """Menandai bahwa quota key ini telah exceeded"""
