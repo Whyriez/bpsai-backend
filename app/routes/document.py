@@ -4,7 +4,8 @@ from flask_jwt_extended import jwt_required, get_jwt
 from ..services import process_and_save_pdf, GeminiService
 from ..models import db, PdfDocument, DocumentChunk, BatchJob, JobStatus 
 from datetime import datetime, timedelta
-from sqlalchemy import cast, String
+from sqlalchemy import cast, String, func
+from sqlalchemy.orm import aliased
 import threading
 import time
 from pathlib import Path
@@ -23,50 +24,68 @@ HEARTBEAT_INTERVAL = 10
 def get_all_documents():
     """
     Mengembalikan daftar semua dokumen yang telah diproses untuk ditampilkan
-    di halaman utama dashboard.
+    di halaman utama dashboard. (VERSI OPTIMIZED)
     """
     try:
         page = request.args.get('page', 1, type=int)
         per_page = request.args.get('per_page', 10, type=int)
         search_term = request.args.get('search', None, type=str)
-        query = PdfDocument.query
+        
+        # 1. BUAT SUBQUERY untuk menghitung chunk 'table' per dokumen
+        # Ini akan membuat query (SELECT document_id, COUNT(*) as table_page_count FROM ... GROUP BY document_id)
+        table_counts_sq = db.session.query(
+            DocumentChunk.document_id,
+            func.count(DocumentChunk.id).label('table_page_count')
+        ).filter(
+            DocumentChunk.chunk_metadata.op('->>')('type') == 'table'
+        ).group_by(DocumentChunk.document_id).subquery()
+
+        # 2. MODIFIKASI QUERY UTAMA untuk mengambil data dari subquery
+        # Kita menggunakan outerjoin agar dokumen yang tidak punya tabel (count = 0) tetap muncul
+        query = db.session.query(
+            PdfDocument,
+            # func.coalesce digunakan untuk mengubah hasil NULL (jika tidak ada tabel) menjadi 0
+            func.coalesce(table_counts_sq.c.table_page_count, 0).label('calculated_table_count')
+        ).outerjoin(
+            table_counts_sq, PdfDocument.id == table_counts_sq.c.document_id
+        )
 
         if search_term:
-            # Gunakan ilike untuk pencarian case-insensitive
             query = query.filter(PdfDocument.filename.ilike(f"%{search_term}%"))
-
-        paginated_docs = query.order_by(PdfDocument.created_at.desc()).paginate(
+        
+        # Paginate hasil query gabungan
+        paginated_results = query.order_by(PdfDocument.created_at.desc()).paginate(
             page=page, 
             per_page=per_page, 
             error_out=False
         )
         
-        documents_on_page = paginated_docs.items
-        
+        # 3. UBAH CARA ITERASI karena hasilnya sekarang adalah tuple (PdfDocument, count)
         results = []
-        for doc in documents_on_page:
-            table_page_count = sum(1 for chunk in doc.chunks if chunk.chunk_metadata and chunk.chunk_metadata.get('type') == 'table')
+        for doc, table_page_count in paginated_results.items:
             results.append({
                 "id": doc.id,
                 "filename": doc.filename,
                 "link": doc.link,
                 "total_pages": doc.total_pages,
-                "table_page_count": table_page_count,
+                "table_page_count": table_page_count, # <-- Gunakan hasil yang sudah dihitung SQL
                 "processed_at": doc.created_at.isoformat()
             })
             
         return jsonify({
             "pagination": {
-                "total_items": paginated_docs.total,
-                "total_pages": paginated_docs.pages,
-                "current_page": paginated_docs.page,
-                "per_page": paginated_docs.per_page,
-                "has_next": paginated_docs.has_next,
-                "has_prev": paginated_docs.has_prev
+                "total_items": paginated_results.total,
+                "total_pages": paginated_results.pages,
+                "current_page": paginated_results.page,
+                "per_page": paginated_results.per_page,
+                "has_next": paginated_results.has_next,
+                "has_prev": paginated_results.has_prev
             },
             "documents": results
         }), 200
     except Exception as e:
+        # Tambahkan logging untuk debug yang lebih baik
+        current_app.logger.error(f"Error fetching document list: {e}", exc_info=True)
         return jsonify({"error": "Gagal mengambil data dokumen", "details": str(e)}), 500
 
 @document_bp.route('/<uuid:document_id>', methods=['PUT'])
