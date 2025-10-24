@@ -129,6 +129,12 @@ def get_combined_relevant_results(user_prompt: str, requested_years: list = [], 
 
 @chat_bp.route('/stream', methods=['POST'])
 def stream():
+    # --- SAKLAR MANUAL UNTUK DEMO ---
+    # Ubah nilai ini ke False untuk menonaktifkan SPK dan menggunakan urutan pencarian vektor standar.
+    # Ubah ke True untuk mengaktifkan re-ranking dengan SPK-SAW.
+    DEMO_MODE_USE_SPK = True 
+    # ------------------------------------
+
     start_time = time.time()
     data = request.json
     user_prompt = data.get('prompt')
@@ -146,7 +152,6 @@ def stream():
         specific_doc = doc_pattern.group(1)
         current_app.logger.info(f"Detected specific document request: {specific_doc}")
 
-    # PERBAIKAN: Extract years lebih awal
     requested_years = extract_years(user_prompt)
 
     log = PromptLog(
@@ -167,7 +172,7 @@ def stream():
         
         with app.app_context():
             try:
-                # Step 1-5: Analisis, History, Searching, Ranking, Building Context
+                # Step 1-2: Analisis & History
                 yield send_thinking_status("searching", 
                     f"Mencari data {'di ' + specific_doc if specific_doc else ''} "
                     f"untuk tahun {', '.join(map(str, requested_years)) if requested_years else 'terbaru'}...")
@@ -180,25 +185,31 @@ def stream():
                 recent_history_logs.reverse()
                 history_context = format_conversation_history(recent_history_logs)
                 
-                # PERBAIKAN: Pass requested_years ke fungsi search
-                yield send_thinking_status("searching", f"Mencari data untuk tahun {', '.join(map(str, requested_years)) if requested_years else 'terbaru'}...")
-                relevant_items = get_combined_relevant_results(
+                # Step 3: Pencarian Awal
+                initial_results_with_distance = get_combined_relevant_results(
                     user_prompt, 
                     requested_years=requested_years, 
-                    specific_document=specific_doc,  # <--- TAMBAHAN INI
+                    specific_document=specific_doc,
                     limit=20
                 )
                 
-                if relevant_items:
-                    yield send_thinking_status("ranking", f"Mengurutkan {len(relevant_items)} hasil pencarian...")
-                    items_to_rerank = [(item, dist) for item, dist in relevant_items]
-                    # PERBAIKAN: Pass requested_years ke reranking
-                    relevant_items = rerank_with_dss(items_to_rerank, requested_years=requested_years)
+                relevant_items = []
                 
+                # Step 4: Ranking (dengan atau tanpa SPK berdasarkan saklar)
+                if initial_results_with_distance:
+                    if DEMO_MODE_USE_SPK:
+                        # KASUS 1: Menggunakan SPK (SAW)
+                        yield send_thinking_status("ranking", f"Menerapkan SPK-SAW untuk mengurutkan {len(initial_results_with_distance)} hasil...")
+                        relevant_items = rerank_with_dss(initial_results_with_distance, requested_years=requested_years)
+                    else:
+                        # KASUS 2: Tanpa SPK
+                        yield send_thinking_status("ranking", "Menggunakan urutan relevansi standar (tanpa SPK)...")
+                        # Mengambil item dari tuple (item, distance), urutan berdasarkan skor vektor
+                        relevant_items = [item for item, dist in initial_results_with_distance]
+
+                # Step 5: Membangun Konteks & Prompt Final
                 yield send_thinking_status("building", "Menyusun konteks jawaban...")
-                # PERBAIKAN: Pass requested_years ke build_context
                 context = build_context(relevant_items, requested_years)
-                # PERBAIKAN: Pass requested_years ke build_final_prompt
                 final_prompt = build_final_prompt(context, user_prompt, history_context, requested_years)
 
                 # Update log dengan data pra-generasi
