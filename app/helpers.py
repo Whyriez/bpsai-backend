@@ -145,6 +145,8 @@ def build_context(relevant_items: list, requested_years: list = []) -> str:
     
     if news_items:
         context += "--- KONTEKS DARI BERITA RESMI BPS ---\n\n"
+        
+        # 1. Kelompokkan berita berdasarkan tahun
         news_by_year = {}
         for news in news_items:
             year = news.tanggal_rilis.year
@@ -152,13 +154,19 @@ def build_context(relevant_items: list, requested_years: list = []) -> str:
                 news_by_year[year] = []
             news_by_year[year].append(news)
         
+        # 2. Iterasi melalui setiap tahun (terbaru dulu)
         for year in sorted(news_by_year.keys(), reverse=True):
-            context += f"### Berita Tahun {year} ###\n"
-            for news in news_by_year[year]:
-                context += f"**Judul:** {news.judul_berita}\n"
-                context += f"**Tanggal Rilis:** {news.tanggal_rilis.strftime('%Y-%m-%d')}\n"
-                context += f"**Ringkasan:** {news.ringkasan}\n"
-                context += f"**Link:** {news.link}\n\n"
+            context += f"### Konteks Berita Tahun {year} ###\n"
+            
+            # Urutkan berita dalam tahun tersebut
+            sorted_news_in_year = sorted(news_by_year[year], key=lambda x: x.tanggal_rilis, reverse=True)
+            
+            # 3. Format setiap berita sebagai sub-sumber yang dapat dikutip di dalam tahun tersebut
+            for news in sorted_news_in_year:
+                context += f"* **Sumber Berita:** {news.judul_berita}\n"
+                context += f"    **Tanggal Rilis:** {news.tanggal_rilis.strftime('%Y-%m-%d')}\n"
+                context += f"    **Link:** {news.link}\n"
+                context += f"    **Konten:** {news.ringkasan}\n\n"
 
     if doc_chunks:
         context += "--- KONTEKS DARI DOKUMEN PDF ---\n\n"
@@ -319,15 +327,39 @@ Kamu adalah Asisten AI Data dari BPS Provinsi Gorontalo. Misi utama kamu adalah 
 #### B4. SERTAKAN CATATAN KAKI & SUMBER (SANGAT PENTING):
 * Setelah menampilkan semua data, kamu **WAJIB** mencari dan menyertakan teks penjelasan tambahan seperti **"Catatan/Note"** dan **"Sumber/Source"** yang ada di dalam konteks. Letakkan ini di bagian akhir jawabanmu di bawah sub-judul "Catatan Tambahan".
 
-#### B5. SITASI SUMBER:
-* Di awal jawaban, sebutkan nama file dan **rentang halaman** yang digunakan (contoh: "Menurut dokumen provinsi-gorontalo-dalam-angka-2025.pdf, halaman 133-135,...").
+#### B5. ATURAN SITASI SUMBER (SANGAT PENTING):
+* Kamu HARUS mengikuti DUA format sitasi yang BERBEDA tergantung jenis sumbernya.
 
+* **1. Untuk data dari DOKUMEN PDF:**
+    * Format jawabanmu HARUS **dimulai** dengan menyebutkan nama file dan rentang halaman.
+    * **Contoh:** "Menurut **dokumen `provinsi-gorontalo-dalam-angka-2025.pdf`, halaman 133-135**, ditemukan data berikut:"
+
+* **2. Untuk data dari BERITA RESMI:**
+    * Formatnya berbeda. Tampilkan dulu **poin data atau tabelnya secara LENGKAP**.
+    * Setelah itu, di baris berikutnya, **WAJIB** tambahkan baris `Sumber:` yang berisi **judul lengkap berita** tersebut.
+    * **JANGAN** membuat ringkasan judul berita di awal jawaban.
+
+* **Contoh Jawaban Berita yang Benar:**
+    ```
+    Inflasi Provinsi Gorontalo Bulan Juli 2025
+    [Tabel atau poin data inflasi di sini]
+    Sumber: Juli 2025, inflasi year on year (yoy) Provinsi Gorontalo sebesar 3,12 persen...
+
+    Kelompok Pengeluaran yang Mengalami Kenaikan Indeks
+    [Tabel atau poin data kelompok pengeluaran di sini]
+    Sumber: Juli 2025, inflasi year on year (yoy) Provinsi Gorontalo sebesar 3,12 persen...
+    ```
+    
 #### B6. FOKUS PADA KONTEKS:
 * Jawabanmu **HARUS** didasarkan **HANYA** pada "Konteks Data Relevan".
 
-#### B7. SERTAKAN LINK SUMBER (PENTING):
-* Setelah bagian "Catatan Tambahan", jika 'Konteks Data' menyediakan **Link** untuk dokumen atau berita yang digunakan, kamu **WAJIB** menampilkannya di bawah judul **"Sumber Digital"**.
-* **Contoh Format:** `Sumber Digital: [provinsi-gorontalo-dalam-angka-2025.pdf](http://path/to/document.pdf)`
+#### B7. ATURAN PENYAJIAN LINK SUMBER DIGITAL (SANGAT PENTING):
+* Di bagian paling akhir jawabanmu, setelah "Catatan Tambahan", kamu WAJIB mengumpulkan SEMUA link yang ada di konteks.
+* Buat **HANYA SATU** sub-judul: **"Sumber Digital"**.
+* Di bawah sub-judul tersebut, tampilkan setiap link sebagai **bullet point** (daftar berpoin) dengan format Markdown `* [Judul](Link)`.
+* **JANGAN PERNAH** mengulang-ulang tulisan "Sumber Digital" untuk setiap link.
+# * Setelah bagian "Catatan Tambahan", jika 'Konteks Data' menyediakan **Link** untuk dokumen atau berita yang digunakan, kamu **WAJIB** menampilkannya di bawah judul **"Sumber Digital"**.
+# * **Contoh Format:** `Sumber Digital: [provinsi-gorontalo-dalam-angka-2025.pdf](http://path/to/document.pdf)`
 """
 
 # def build_final_prompt(context: str, user_prompt: str, history_context: str = "") -> str:
@@ -376,6 +408,11 @@ Kamu adalah Asisten AI Data dari BPS Provinsi Gorontalo. Misi utama kamu adalah 
 # ---
 # **Sekarang jawab pertanyaan ini: "{user_prompt}"**
 # Dengan mengikuti semua aturan di atas.
+
+
+#### B5. SITASI SUMBER (SANGAT PENTING):
+# * Di awal jawaban, sebutkan nama file dan **rentang halaman** yang digunakan (contoh: "Menurut dokumen provinsi-gorontalo-dalam-angka-2025.pdf, halaman 133-135,...").
+
 # """
 
 # SPK SAW

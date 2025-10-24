@@ -27,104 +27,114 @@ def send_thinking_status(status, detail=""):
 
 def get_combined_relevant_results(user_prompt: str, requested_years: list = [], specific_document: str = None, limit: int = 15):
     """
-    PERBAIKAN: Tambahkan parameter requested_years dan tingkatkan strategi pencarian.
+    PERBAIKAN: Mengunci pencarian HANYA ke dokumen yang diminta jika specific_document ada.
     """
-    # Expand dengan akronim
     expanded_prompt = expand_query_with_synonyms(user_prompt, BPS_ACRONYM_DICTIONARY)
     
     if not specific_document:
-        doc_pattern = re.search(r'(?:dokumen|file|pdf)\s+([^\s,]+(?:\s+\w+)*\s+\d{4})', 
-                               user_prompt, re.IGNORECASE)
+        doc_pattern = re.search(r'(?:dokumen|file|pdf)\s+([\w\s\-\.]+)', user_prompt, re.IGNORECASE)
         if doc_pattern:
             specific_document = doc_pattern.group(1)
 
-    # PERBAIKAN: Jika ada tahun spesifik, tambahkan ke query
     if requested_years:
         expanded_prompt = expand_query_with_years(expanded_prompt, requested_years)
-        # PERBAIKAN: Tingkatkan limit jika mencari multiple years
-        limit = max(limit, len(requested_years) * 5)  # Minimal 5 hasil per tahun
-    
-    current_app.logger.info(f"Original prompt: '{user_prompt}', Expanded to: '{expanded_prompt}'")
-    if specific_document:
-        current_app.logger.info(f"Filtering for specific document: {specific_document}")
 
+    current_app.logger.info(f"Original prompt: '{user_prompt}', Expanded to: '{expanded_prompt}'")
+    
     prompt_embedding = embedding_service.generate(expanded_prompt)
     if not prompt_embedding:
         return []
 
     berita_collection, document_collection = get_collections()
-
-    # Query ke collection BeritaBps
-    berita_results = berita_collection.query(
-        query_embeddings=[prompt_embedding],
-        n_results=limit
-    )
-
-    # Query ke collection DocumentChunk
-    chunk_results = document_collection.query(
-        query_embeddings=[prompt_embedding],
-        n_results=limit * 2  # Ambil lebih banyak untuk difilter
-    )
-
-    # Gabungkan dan proses hasil dari ChromaDB
     combined_results = []
 
-    if berita_results['ids'][0]:
-        for i, item_id in enumerate(berita_results['ids'][0]):
-            distance = berita_results['distances'][0][i]
-            berita_obj = db.session.get(BeritaBps, int(item_id)) 
-            if berita_obj:
-                if requested_years:
-                    if berita_obj.tanggal_rilis.year in requested_years:
-                        combined_results.append((berita_obj, distance))
-                else:
-                    combined_results.append((berita_obj, distance))
+    # ===================================================================
+    # LOGIKA BARU: Cek apakah pencarian spesifik ke satu dokumen
+    # ===================================================================
+    if specific_document:
+        current_app.logger.info(f"MODE PENCARIAN SPESIFIK: Mengunci pencarian ke dokumen '{specific_document}'")
+        
+        # 1. Lakukan vector search HANYA pada collection dokumen
+        chunk_results = document_collection.query(
+            query_embeddings=[prompt_embedding],
+            n_results=limit * 2 # Ambil lebih banyak untuk difilter
+        )
 
-    if chunk_results['ids'][0]:
-        for i, item_id in enumerate(chunk_results['ids'][0]):
-            distance = chunk_results['distances'][0][i]
-            chunk_obj = db.session.get(DocumentChunk, item_id)
-            if chunk_obj and chunk_obj.document:
-                # FILTER BERDASARKAN NAMA DOKUMEN JIKA DIMINTA
-                if specific_document:
+        # 2. Filter dengan sangat ketat
+        if chunk_results['ids'][0]:
+            for i, item_id in enumerate(chunk_results['ids'][0]):
+                distance = chunk_results['distances'][0][i]
+                chunk_obj = db.session.get(DocumentChunk, item_id)
+                
+                if chunk_obj and chunk_obj.document:
                     # Normalisasi nama untuk matching yang lebih fleksibel
                     doc_filename = chunk_obj.document.filename.lower().replace('.pdf', '')
                     search_term = specific_document.lower().replace('.pdf', '')
                     
-                    # Cek apakah nama dokumen mengandung search term
+                    # Hanya tambahkan jika nama file MENGANDUNG search term
                     if search_term in doc_filename:
                         combined_results.append((chunk_obj, distance))
-                        current_app.logger.debug(f"Matched: {chunk_obj.document.filename}")
-                else:
+                        current_app.logger.debug(f"✓ Ditemukan & Cocok: {chunk_obj.document.filename} (Hal: {chunk_obj.page_number})")
+                    else:
+                        current_app.logger.debug(f"✗ Ditemukan tapi Ditolak: {chunk_obj.document.filename} (tidak cocok dengan '{search_term}')")
+        
+        # 3. Fallback jika tidak ada hasil sama sekali
+        if not combined_results:
+            current_app.logger.warning(f"Tidak ada hasil dari vector search untuk '{specific_document}', mencoba query DB langsung.")
+            from sqlalchemy import func
+            direct_chunks = DocumentChunk.query.join(PdfDocument).filter(
+                func.lower(PdfDocument.filename).contains(specific_document.lower())
+            ).limit(10).all()
+            
+            for chunk in direct_chunks:
+                combined_results.append((chunk, 0.7)) # Beri skor jarak default
+
+    else:
+        # ===================================================================
+        # LOGIKA LAMA: Pencarian umum jika tidak ada dokumen spesifik
+        # ===================================================================
+        current_app.logger.info("MODE PENCARIAN UMUM: Mencari di semua sumber data.")
+        
+        # Query ke collection BeritaBps
+        berita_results = berita_collection.query(
+            query_embeddings=[prompt_embedding], n_results=limit
+        )
+
+        # Query ke collection DocumentChunk
+        chunk_results = document_collection.query(
+            query_embeddings=[prompt_embedding], n_results=limit * 2
+        )
+        
+        # Proses hasil berita
+        if berita_results['ids'][0]:
+            for i, item_id in enumerate(berita_results['ids'][0]):
+                distance = berita_results['distances'][0][i]
+                berita_obj = db.session.get(BeritaBps, int(item_id)) 
+                if berita_obj:
+                    if requested_years and berita_obj.tanggal_rilis.year not in requested_years:
+                        continue # Lewati jika tahun tidak cocok
+                    combined_results.append((berita_obj, distance))
+        
+        # Proses hasil chunk
+        if chunk_results['ids'][0]:
+            for i, item_id in enumerate(chunk_results['ids'][0]):
+                distance = chunk_results['distances'][0][i]
+                chunk_obj = db.session.get(DocumentChunk, item_id)
+                if chunk_obj and chunk_obj.document:
                     combined_results.append((chunk_obj, distance))
 
-    if specific_document and len(combined_results) == 0:
-        current_app.logger.warning(f"No results found for document '{specific_document}', trying broader search")
-        # Coba query langsung ke database
-        from sqlalchemy import or_, func
-        direct_chunks = DocumentChunk.query.join(PdfDocument).filter(
-            func.lower(PdfDocument.filename).contains(specific_document.lower())
-        ).limit(10).all()
-        
-        for chunk in direct_chunks:
-            combined_results.append((chunk, 0.7))
-
-    # PERBAIKAN: Jika hasil masih kurang dan ada tahun spesifik, coba fallback query
-    if requested_years and len(combined_results) < len(requested_years):
-        current_app.logger.warning(f"Insufficient results for years {requested_years}, attempting fallback query")
-        # Fallback: Query langsung ke database berdasarkan tahun
+    # Jika ada permintaan tahun spesifik dan hasil masih kurang, lakukan fallback
+    if requested_years and len(combined_results) < len(requested_years) and not specific_document:
+        current_app.logger.warning(f"Hasil kurang untuk tahun {requested_years}, mencoba fallback query.")
         for year in requested_years:
             additional_news = BeritaBps.query.filter(
                 db.extract('year', BeritaBps.tanggal_rilis) == year
             ).limit(3).all()
-            
             for news in additional_news:
-                # Cek apakah sudah ada di results
-                if not any(item.id == news.id for item, _ in combined_results if isinstance(item, BeritaBps)):
-                    combined_results.append((news, 0.5))  # Distance moderat untuk fallback
+                if not any(isinstance(item, BeritaBps) and item.id == news.id for item, _ in combined_results):
+                    combined_results.append((news, 0.5))
 
     combined_results.sort(key=lambda x: x[1])
-
     return combined_results[:limit]
 
 @chat_bp.route('/stream', methods=['POST'])
@@ -146,8 +156,7 @@ def stream():
     db.session.expire_all()
 
     specific_doc = None
-    doc_pattern = re.search(r'(?:dokumen|file|pdf)\s+([^\s,]+(?:\s+\w+)*\s+\d{4})', 
-                           user_prompt, re.IGNORECASE)
+    doc_pattern = re.search(r'(?:dokumen|file|pdf)\s+([\w\s\-\.]+)', user_prompt, re.IGNORECASE)
     if doc_pattern:
         specific_doc = doc_pattern.group(1)
         current_app.logger.info(f"Detected specific document request: {specific_doc}")
