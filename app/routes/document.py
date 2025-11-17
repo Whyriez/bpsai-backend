@@ -317,6 +317,7 @@ def get_chunk_details(chunk_id):
         return jsonify({
             "chunk_id": chunk.id,
             "page_number": chunk.page_number,
+            "type": chunk.chunk_metadata.get('type'),
             "image_path": f"/api/documents/images/{chunk.chunk_metadata.get('image_path')}" if chunk.chunk_metadata.get('image_path') else None,
             "chunk_content": chunk.chunk_content, # Teks mentah/sebelumnya
             "reconstructed_content": chunk.reconstructed_content # Teks yang sudah bersih (jika ada)

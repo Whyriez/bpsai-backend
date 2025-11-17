@@ -91,12 +91,204 @@ def get_all_analytics():
     else:
         response_time_distribution = {'fast': 0, 'medium': 0, 'slow': 0}
 
-    # --- 2. Top Keywords & Topics ---
+    # --- 2. Top Keywords & Topics (REFINED VERSION) ---
+    
     all_keywords_logs = db.session.query(PromptLog.extracted_keywords)\
         .filter(PromptLog.extracted_keywords.isnot(None)).all()
+
+    # Stop words
+    analytics_stop_words = {
+        'saya', 'aku', 'kamu', 'anda', 'dia', 'mereka', 'kita', 'kami',
+        'ini', 'itu', 'tersebut', 'begini', 'begitu', 'hanya', 'saja', 'cuma',
+        'apa', 'siapa', 'kapan', 'kenapa', 'mengapa', 'bagaimana', 'berapa', 'dimana', 'mana', 'yang',
+        'hallo', 'hai', 'halo', 'selamat', 'pagi', 'siang', 'malam', 'sore',
+        'jelaskan', 'tampilkan', 'berikan', 'sebutkan', 'cari', 'carikan', 'tolong',
+        'analisis', 'buatkan', 'buat', 'analisa', 'lihat', 'lihatkan', 'tunjukkan',
+        'minta', 'mohon', 'bantu', 'bantuan', 'butuh', 'dong', 'ya', 'aja',
+        'di', 'ke', 'dari', 'pada', 'untuk', 'dengan', 'dan', 'atau', 'tapi', 
+        'hingga', 'sampai', 'oleh', 'dalam', 'tentang', 'mengenai', 'per', 'se',
+        'data', 'informasi', 'tahun', 'bulan', 'terbaru', 'lebih', 'detail', 'rinci', 
+        'lengkap', 'secara', 'terima', 'kasih', 'bentuk', 'menurut',
+        'kota', 'kabupaten', 'provinsi', 'daerah', 'wilayah', 'lokasi', 'tempat',
+        'gorontalo', 'sulawesi', 'utara', 'selatan', 'barat', 'timur', 'tengah',
+        'tabel', 'dokumen', 'file', 'laporan', 'list', 'daftar', 'jumlah', 'total',
+        'ntp', 'dll', 'dsb', 'dst', 'yg', 'utk', 'dgn', 'sbg', 'pd', 'dr',
+        'besar', 'kecil', 'tinggi', 'rendah', 'banyak', 'sedikit', 'baik', 'buruk',
+        'khusus', 'umum', 'sama', 'beda', 'lain', 'semua', 'setiap',
+        'sajikan', 'meningkat', 'tren', 'datanya', 'berdasarkan',
+        'januari', 'februari', 'maret', 'april', 'mei', 'juni',
+        'juli', 'agustus', 'september', 'oktober', 'november', 'desember',
+        '2022', '2023', '2024', '2025'
+    }
+
+    # Kata yang HARUS dalam compound (tidak boleh standalone)
+    must_be_compound = {
+        'penduduk', 'kecamatan', 'kelurahan', 'desa',
+        'tingkat', 'persentase', 'rasio', 'indeks',
+        'statistik', 'analisis', 'laporan'
+    }
+
+    # Kata yang boleh standalone (sangat spesifik)
+    standalone_allowed = {
+        'inflasi', 'deflasi', 'kemiskinan', 'pengangguran',
+        'ekspor', 'impor', 'investasi', 'produksi', 'konsumsi',
+        'pdrb', 'apbd', 'apbn', 'pariwisata', 'pertanian',
+        'perikanan', 'kehutanan', 'pertambangan', 'manufaktur',
+        'konstruksi', 'transportasi'
+    }
+
+    # Ordered pairs untuk phrase normalization (urutan yang benar)
+    phrase_order_rules = {
+        ('ekonomi', 'pertumbuhan'): 'pertumbuhan ekonomi',
+        ('pertumbuhan', 'ekonomi'): 'pertumbuhan ekonomi',
+        ('produksi', 'timur'): None,  # Invalid combination
+        ('timur', 'produksi'): None,  # Invalid combination
+        ('miskin', 'penduduk'): 'penduduk miskin',
+        ('penduduk', 'miskin'): 'penduduk miskin',
+        ('tingkat', 'inflasi'): 'tingkat inflasi',
+        ('inflasi', 'tingkat'): 'tingkat inflasi',
+        ('tingkat', 'kemiskinan'): 'tingkat kemiskinan',
+        ('kemiskinan', 'tingkat'): 'tingkat kemiskinan',
+        ('tingkat', 'pengangguran'): 'tingkat pengangguran',
+        ('pengangguran', 'tingkat'): 'tingkat pengangguran',
+    }
+
+    def normalize_phrase(words):
+        """Normalisasi urutan kata dalam frasa."""
+        if len(words) == 2:
+            pair = (words[0], words[1])
+            if pair in phrase_order_rules:
+                normalized = phrase_order_rules[pair]
+                return normalized.split() if normalized else None
+        return words
+
+    def is_valid_combination(words):
+        """Cek apakah kombinasi kata valid (bukan random combination)."""
+        # Cek di phrase_order_rules jika ada yang explicitly invalid
+        if len(words) == 2:
+            pair = (words[0], words[1])
+            if pair in phrase_order_rules and phrase_order_rules[pair] is None:
+                return False
+        
+        # Cek kombinasi yang tidak masuk akal (contoh: "produksi timur")
+        # Arah mata angin tidak boleh jadi modifier produksi
+        directions = {'utara', 'selatan', 'barat', 'timur', 'tengah'}
+        has_direction = any(w in directions for w in words)
+        has_production = any(w in ['produksi', 'konsumsi', 'distribusi'] for w in words)
+        
+        if has_direction and has_production:
+            # Kecuali ada kata lain yang memvalidasi (misal: "produksi jawa timur")
+            if len(words) < 3:
+                return False
+        
+        return True
+
+    def clean_and_combine_keywords(keywords_list):
+        """Membersihkan dan menggabungkan keywords dengan rules yang lebih ketat."""
+        if not keywords_list or not isinstance(keywords_list, list):
+            return None
+        
+        keywords_lower = [kw.lower() for kw in keywords_list]
+        
+        # Filter stop words
+        filtered = [kw for kw in keywords_lower if kw not in analytics_stop_words]
+        
+        if not filtered:
+            return None
+        
+        # Cek apakah ada kata yang valuable
+        has_valuable = any(
+            kw in standalone_allowed or kw in must_be_compound 
+            for kw in filtered
+        )
+        if not has_valuable:
+            return None
+        
+        # Single keyword: hanya boleh jika dalam standalone_allowed
+        if len(filtered) == 1:
+            word = filtered[0]
+            if word in standalone_allowed and len(word) >= 6:
+                return word
+            return None  # Single keyword dari must_be_compound tidak boleh
+        
+        # Multiple keywords: buat compound
+        # Prioritaskan valuable keywords
+        valuable_words = [w for w in filtered if w in standalone_allowed or w in must_be_compound]
+        other_words = [w for w in filtered if w not in standalone_allowed and w not in must_be_compound]
+        
+        # Ambil max 2-3 kata
+        phrase_words = valuable_words[:2]
+        if len(phrase_words) < 2 and other_words:
+            phrase_words.extend(other_words[:3 - len(phrase_words)])
+        
+        # Limit to max 3 words
+        phrase_words = phrase_words[:3]
+        
+        if len(phrase_words) < 2:
+            return None
+        
+        # Normalize urutan
+        normalized = normalize_phrase(phrase_words)
+        if normalized is None:
+            return None
+        
+        # Validasi kombinasi
+        if not is_valid_combination(normalized):
+            return None
+        
+        return ' '.join(normalized)
+
+    # Proses semua logs
+    phrase_list = []
+    for log in all_keywords_logs:
+        keywords = log[0]
+        phrase = clean_and_combine_keywords(keywords)
+        if phrase:
+            phrase_list.append(phrase)
     
-    keyword_list = [keyword for log in all_keywords_logs for keyword in log[0]]
-    top_keywords = [{'keyword': item, 'count': count} for item, count in Counter(keyword_list).most_common(6)]
+    # Hitung frekuensi
+    phrase_counter = Counter(phrase_list)
+    
+    # Filter dan deduplikasi
+    def phrases_overlap(p1, p2):
+        """Cek overlap antara 2 frasa."""
+        words1 = set(p1.split())
+        words2 = set(p2.split())
+        
+        if not words1 or not words2:
+            return False
+        
+        overlap = len(words1 & words2)
+        min_len = min(len(words1), len(words2))
+        
+        return overlap / min_len > 0.6  # 60% overlap
+    
+    # Sort by count desc, then by length desc
+    phrase_items = list(phrase_counter.items())
+    phrase_items.sort(key=lambda x: (-x[1], -len(x[0])))
+    
+    selected_phrases = []
+    
+    for phrase, count in phrase_items:
+        if count < 3:  # Minimal 3 kemunculan
+            continue
+        
+        # Cek overlap dengan yang sudah dipilih
+        has_overlap = any(
+            phrases_overlap(phrase, selected['keyword'].lower()) 
+            for selected in selected_phrases
+        )
+        
+        if not has_overlap:
+            selected_phrases.append({
+                'keyword': phrase.title(),
+                'count': count
+            })
+        
+        if len(selected_phrases) >= 12:
+            break
+    
+    top_keywords = sorted(selected_phrases, key=lambda x: x['count'], reverse=True)[:12]
 
     # --- 3. Tingkat Keberhasilan Pengambilan Data ---
     data_requests_query = PromptLog.query.filter(PromptLog.detected_intent == 'data_request')
@@ -108,7 +300,6 @@ def get_all_analytics():
     data_coverage = []
     current_year = datetime.utcnow().year
     for year in range(current_year, current_year - 3, -1):
-        # Menggunakan cast(..., TEXT) untuk mengubah JSON array ke text
         year_query = PromptLog.query.filter(cast(PromptLog.extracted_years, TEXT).like(f'%{year}%'))
         total_year_queries = year_query.count()
         successful_year_queries = year_query.filter(PromptLog.found_results == True).count()
@@ -133,7 +324,7 @@ def get_all_analytics():
         'retrievalSuccessRate': round(retrieval_success_rate, 1),
         'dataCoverage': data_coverage,
         'servicePerformance': {
-            'uptime': "99.9%", # Nilai statis karena uptime biasanya dimonitor eksternal
+            'uptime': "99.9%",
             'accuracy': round(accuracy, 1),
             'userSatisfaction': round(satisfaction_score, 1)
         }

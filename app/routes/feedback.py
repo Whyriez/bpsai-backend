@@ -102,31 +102,47 @@ def get_all_feedback():
 def handle_feedback():
     data = request.json
     
-    prompt_log_id = data.get('prompt_log_id')
+    # ID ini adalah ID unik untuk PESAN (misal: "35ef4b97...")
+    # Kita tidak menggunakannya untuk query, tapi mungkin berguna untuk 'comment'
+    prompt_log_uuid_from_client = data.get('prompt_log_id') 
+    
     feedback_type = data.get('type')
     comment = data.get('comment')
+    
+    # ID ini adalah ID untuk seluruh PERCAKAPAN (conversation_id)
     sessionId = data.get('session_id')
 
-    if not prompt_log_id or not feedback_type:
-        return jsonify({'error': 'prompt_log_id and type are required'}), 400
+    if not feedback_type:
+        return jsonify({'error': 'type is required'}), 400
+    
+    # --- INI SOLUSINYA ---
+    # Kita harus mencari berdasarkan 'sessionId' (ID percakapan)
+    # bukan 'prompt_log_id' (ID pesan)
+    
+    if not sessionId:
+        return jsonify({'error': 'session_id is required for feedback'}), 400
 
-    if feedback_type not in ['positive', 'negative']:
-        return jsonify({'error': 'Invalid feedback type'}), 400
+    # 1. Cari log TERBARU yang cocok dengan ID PERCAKAPAN
+    prompt_log = PromptLog.query.filter_by(session_id=sessionId)\
+                                .order_by(PromptLog.id.desc())\
+                                .first()
 
-    # Buat entri feedback baru
+    if not prompt_log:
+        # Jika ini terjadi, berarti 'sessionId' dari frontend tidak ada di DB
+        return jsonify({'error': 'PromptLog not found for the given session_id'}), 404
+    # --- AKHIR SOLUSI ---
+
+    # 2. Buat feedback baru, tautkan ke 'prompt_log.id' (Integer) yang benar
     new_feedback = Feedback(
-        prompt_log_id=prompt_log_id,
+        prompt_log_id=prompt_log.id,  # <-- Tautkan ke PK integer yang benar
         type=feedback_type,
         comment=comment,
-        session_id=sessionId
+        session_id=sessionId 
     )
-    
-    prompt_log = PromptLog.query.get(prompt_log_id)
-    if not prompt_log:
-        return jsonify({'error': 'PromptLog not found'}), 404
     
     db.session.add(new_feedback)
 
+    # 3. (Sisa logika Anda sudah benar)
     if prompt_log.retrieved_news_ids:
         for item_ref in prompt_log.retrieved_news_ids:
             entity_type = item_ref.get('type')
@@ -144,21 +160,16 @@ def handle_feedback():
                 feedback_score = DocumentFeedbackScore(entity_type=entity_type, entity_id=entity_id)
                 db.session.add(feedback_score)
             
-            # --- PERBAIKAN DI SINI ---
-            # Pastikan nilai count bukan None sebelum operasi penambahan
             if feedback_score.positive_feedback_count is None:
                 feedback_score.positive_feedback_count = 0
             if feedback_score.negative_feedback_count is None:
                 feedback_score.negative_feedback_count = 0
-            # --- AKHIR PERBAIKAN ---
 
-            # Update count berdasarkan tipe feedback
             if feedback_type == 'positive':
                 feedback_score.positive_feedback_count += 1
             else:
                 feedback_score.negative_feedback_count += 1
             
-            # Hitung ulang skor
             feedback_score.update_score()
             
     db.session.commit()

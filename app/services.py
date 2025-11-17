@@ -49,7 +49,6 @@ class EmbeddingService:
             keys.append(key_value)
             i += 1
         
-        # Fallback ke format lama
         if not keys:
             old_keys_str = os.getenv('GEMINI_API_KEYS', '')
             old_keys_list = [key.strip() for key in old_keys_str.split(',') if key.strip()]
