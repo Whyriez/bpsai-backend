@@ -1,3 +1,4 @@
+import os
 import click
 import time
 import re
@@ -262,27 +263,85 @@ def register_commands(app):
 
     @app.cli.command("db:seed")
     def db_seed():
-        """Seeds the database with initial data (e.g., an admin user)."""
+        """Seeds the database with initial data (admin user from ENV)."""
         click.echo("Seeding database...")
 
+        # Ambil konfigurasi dari Environment Variable
+        # Format di .env:
+        # SEED_ADMIN_EMAIL=nama@bps.go.id
+        # SEED_ADMIN_USERNAME=admin_utama (opsional, default 'admin')
+
+        email_admin = os.getenv('SEED_ADMIN_EMAIL')
+        username_admin = os.getenv('SEED_ADMIN_USERNAME', 'admin')
+
+        # Validasi keamanan: Pastikan email diset di .env
+        if not email_admin:
+            click.secho("❌ Error: Variabel 'SEED_ADMIN_EMAIL' tidak ditemukan di .env", fg='red', bold=True)
+            click.echo("Silahkan tambahkan baris berikut di file .env anda:")
+            click.echo("SEED_ADMIN_EMAIL=email_anda@bps.go.id")
+            return
+
         with app.app_context():
-            # Cek apakah admin sudah ada
-            if User.query.filter_by(username='admin').first() is None:
-                # Buat user admin baru
+            existing_user = User.query.filter_by(email=email_admin).first()
+
+            existing_username = User.query.filter_by(username=username_admin).first()
+
+            if existing_user is None and existing_username is None:
                 admin_user = User(
-                    username='admin',
-                    email='admin@bps.go.id',
+                    username=username_admin,
+                    email=email_admin,
                     role='admin'
                 )
-                admin_user.set_password('admin123') # Ganti dengan password yang aman
-                
-                db.session.add(admin_user)
-                click.echo("Admin user created.")
-            else:
-                click.echo("Admin user already exists.")
 
+                db.session.add(admin_user)
+                db.session.commit()
+
+                click.secho(f"✅ Admin user registered successfully!", fg='green')
+                click.echo(f"   Email: {email_admin}")
+                click.echo(f"   Username: {username_admin}")
+                click.echo(f"   Role: admin")
+
+            elif existing_user:
+                click.secho(f"⚠️ User dengan email {email_admin} sudah ada.", fg='yellow')
+            elif existing_username:
+                click.secho(
+                    f"⚠️ User dengan username {username_admin} sudah ada. Silahkan ganti SEED_ADMIN_USERNAME di .env",
+                    fg='yellow')
+
+            click.echo("Database seeding process finished.")
+
+    @app.cli.command("user:create-admin")
+    @click.argument("email")
+    @click.argument("username")
+    @with_appcontext
+    def create_admin_manual(email, username):
+        """
+        Buat user admin baru langsung dari terminal.
+        Contoh: flask user:create-admin nur.alim@bps.go.id nuralim
+        """
+        # 1. Cek duplikasi
+        if User.query.filter((User.email == email) | (User.username == username)).first():
+            click.secho(f"❌ User dengan email {email} atau username {username} sudah ada!", fg='red')
+            return
+
+        # 2. Buat user
+        try:
+            new_admin = User(
+                username=username,
+                email=email,
+                role='admin'  # Langsung set jadi admin
+            )
+
+            db.session.add(new_admin)
             db.session.commit()
-            click.echo("Database seeded!")
+
+            click.secho(f"✅ Berhasil membuat Admin baru!", fg='green', bold=True)
+            click.echo(f"   Email: {email}")
+            click.echo(f"   Username: {username}")
+
+        except Exception as e:
+            db.session.rollback()
+            click.secho(f"❌ Gagal membuat user: {e}", fg='red')
 
     @app.cli.command("sync-vectordb")
     @with_appcontext

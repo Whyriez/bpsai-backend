@@ -15,7 +15,22 @@ env_manager = EnvManager()
 @api_keys_bp.route('/api/gemini-keys', methods=['GET'])
 # @jwt_required()
 def get_api_keys():
-    """Mendapatkan semua API keys info (tanpa value sebenarnya)"""
+    """
+    Mendapatkan semua info API keys (tanpa value sebenarnya).
+    ---
+    tags:
+      - API Key Management
+    summary: Mendapatkan daftar dan status semua API key Gemini.
+    security:
+      - Bearer: []
+    responses:
+      200:
+        description: Daftar API key berhasil diambil.
+      401:
+        description: Token tidak valid atau tidak ada (Unauthorized).
+      500:
+        description: Gagal mengambil data API keys.
+    """
     try:
         # Dapatkan config dari database
         key_configs = GeminiApiKeyConfig.query.order_by(GeminiApiKeyConfig.key_alias).all()
@@ -58,7 +73,38 @@ def get_api_keys():
 @api_keys_bp.route('/api/gemini-keys', methods=['POST'])
 # @jwt_required()
 def add_api_key():
-    """Menambah API key baru ke .env dan me-reload service secara dinamis."""
+    """
+    Menambah API key baru ke .env dan me-reload service secara dinamis.
+    ---
+    tags:
+      - API Key Management
+    summary: Menambahkan API key baru.
+    security:
+      - Bearer: []
+    parameters:
+      - in: body
+        name: body
+        description: API key dan nama untuk key baru.
+        required: true
+        schema:
+          type: object
+          properties:
+            api_key:
+              type: string
+              example: "AIzaSy...your...key...here"
+            key_name:
+              type: string
+              example: "Kunci Cadangan 1"
+    responses:
+      201:
+        description: API key berhasil ditambahkan.
+      400:
+        description: Format data salah atau key tidak valid.
+      401:
+        description: Token tidak valid atau tidak ada (Unauthorized).
+      500:
+        description: "Gagal menambahkan API key (misal: .env tidak bisa ditulis)."
+    """
     try:
         data = request.json
         api_key = data.get('api_key')
@@ -119,7 +165,43 @@ def add_api_key():
 @api_keys_bp.route('/api/gemini-keys/<string:alias>', methods=['PUT'])
 @jwt_required()
 def update_api_key(alias):
-    """Update API key metadata"""
+    """
+    Update metadata API key (nama atau status aktif).
+    ---
+    tags:
+      - API Key Management
+    summary: Memperbarui nama atau status aktif API key.
+    security:
+      - Bearer: []
+    parameters:
+      - name: alias
+        in: path
+        type: string
+        required: true
+        description: "Alias dari key (misal: '1', '2')."
+      - in: body
+        name: body
+        description: Data yang akan diperbarui.
+        required: true
+        schema:
+          type: object
+          properties:
+            key_name:
+              type: string
+              example: "Kunci Utama (Sudah Diperbarui)"
+            is_active:
+              type: boolean
+              example: false
+    responses:
+      200:
+        description: API key berhasil diupdate.
+      401:
+        description: Token tidak valid atau tidak ada (Unauthorized).
+      404:
+        description: API key tidak ditemukan.
+      500:
+        description: Gagal mengupdate API key.
+    """
     try:
         data = request.json
         config = GeminiApiKeyConfig.query.filter_by(key_alias=alias).first_or_404()
@@ -150,7 +232,28 @@ def update_api_key(alias):
 @api_keys_bp.route('/api/gemini-keys/<string:alias>', methods=['DELETE'])
 # @jwt_required()
 def delete_api_key(alias):
-    """Hapus API key dari .env, database, dan reload service secara dinamis."""
+    """
+    Hapus API key dari .env, database, dan reload service secara dinamis.
+    ---
+    tags:
+      - API Key Management
+    summary: Menghapus API key secara permanen.
+    security:
+      - Bearer: []
+    parameters:
+      - name: alias
+        in: path
+        type: string
+        required: true
+        description: "Alias dari key yang akan dihapus (misal: '1', '2')."
+    responses:
+      200:
+        description: API key berhasil dihapus.
+      401:
+        description: Token tidak valid atau tidak ada (Unauthorized).
+      500:
+        description: Gagal menghapus API key.
+    """
     try:
         # Hapus dari .env file
         success = env_manager.remove_key(alias)
@@ -183,7 +286,22 @@ def delete_api_key(alias):
 @api_keys_bp.route('/api/gemini-keys/sync', methods=['POST'])
 @jwt_required()
 def sync_keys():
-    """Sync antara .env dan database"""
+    """
+    Sinkronisasi key dari file .env ke database (jika ada key di .env tapi belum ada di DB).
+    ---
+    tags:
+      - API Key Management
+    summary: Sinkronisasi key dari .env ke database.
+    security:
+      - Bearer: []
+    responses:
+      200:
+        description: Sinkronisasi berhasil.
+      401:
+        description: Token tidak valid atau tidak ada (Unauthorized).
+      500:
+        description: Gagal sync API keys.
+    """
     try:
         env_keys = env_manager.get_gemini_keys()
         
@@ -215,7 +333,22 @@ def sync_keys():
 @api_keys_bp.route('/api/gemini-keys/stats', methods=['GET'])
 @jwt_required()
 def get_api_keys_stats():
-    """Mendapatkan statistik API keys"""
+    """
+    Mendapatkan statistik penggunaan agregat semua API keys.
+    ---
+    tags:
+      - API Key Management
+    summary: Mendapatkan statistik agregat semua API key.
+    security:
+      - Bearer: []
+    responses:
+      200:
+        description: Statistik berhasil diambil.
+      401:
+        description: Token tidak valid atau tidak ada (Unauthorized).
+      500:
+        description: Gagal mengambil statistik API keys.
+    """
     try:
         total_keys = GeminiApiKeyConfig.query.count()
         active_keys = GeminiApiKeyConfig.query.filter_by(is_active=True).count()

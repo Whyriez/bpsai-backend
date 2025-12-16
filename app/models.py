@@ -152,18 +152,9 @@ class User(db.Model):
     id = db.Column(db.Integer, primary_key=True)
     username = db.Column(db.String(80), unique=True, nullable=False, index=True)
     email = db.Column(db.String(120), unique=True, nullable=False, index=True)
-    password_hash = db.Column(db.String(255), nullable=False)
     role = db.Column(db.String(80), nullable=False, default='user')
     created_at = db.Column(db.DateTime(timezone=True), default=lambda: datetime.now(pytz.utc))
     updated_at = db.Column(db.DateTime(timezone=True), default=lambda: datetime.now(pytz.utc), onupdate=lambda: datetime.now(pytz.utc))
-
-    def set_password(self, password):
-        """Membuat hash dari password dan menyimpannya."""
-        self.password_hash = generate_password_hash(password)
-
-    def check_password(self, password):
-        """Memeriksa apakah password yang diberikan cocok dengan hash yang tersimpan."""
-        return check_password_hash(self.password_hash, password)
 
     def __repr__(self):
         return f'<User {self.username}>'

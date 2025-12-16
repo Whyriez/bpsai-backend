@@ -13,6 +13,42 @@ def get_berita_list():
     """
     Endpoint untuk mengambil daftar data BeritaBps dengan paginasi,
     pencarian, dan pengurutan untuk diintegrasikan dengan Datatables.
+    ---
+    tags:
+      - Berita BPS
+    summary: Mendapatkan daftar berita BPS (untuk Datatables).
+    security:
+      - Bearer: []
+    parameters:
+      - name: draw
+        in: query
+        type: integer
+        description: Nomor draw dari Datatables untuk sinkronisasi.
+      - name: start
+        in: query
+        type: integer
+        description: Indeks awal untuk paginasi.
+      - name: length
+        in: query
+        type: integer
+        description: Jumlah data yang akan diambil (ukuran halaman).
+      - name: search[value]
+        in: query
+        type: string
+        description: Kata kunci pencarian.
+      - name: order[0][column]
+        in: query
+        type: integer
+        description: Indeks kolom yang akan diurutkan.
+      - name: order[0][dir]
+        in: query
+        type: string
+        description: Arah pengurutan (asc atau desc).
+    responses:
+      200:
+        description: Sukses, mengembalikan data format Datatables.
+      401:
+        description: Token tidak valid atau tidak ada (Unauthorized).
     """
     # Parameter dari DataTables
     draw = request.args.get('draw', type=int)
@@ -89,7 +125,45 @@ def get_berita_list():
 def add_berita():
     """
     Endpoint untuk menambahkan data BeritaBps baru.
-    Embedding akan digenerate secara otomatis oleh model listener.
+    ---
+    tags:
+      - Berita BPS
+    summary: Menambahkan data berita BPS baru.
+    security:
+      - Bearer: []
+    parameters:
+      - in: body
+        name: body
+        description: Data berita BPS yang akan ditambahkan.
+        required: true
+        schema:
+          type: object
+          properties:
+            judul_berita:
+              type: string
+              example: "Inflasi Gorontalo Bulan Oktober 2025"
+            tanggal_rilis:
+              type: string
+              format: date
+              example: "2025-11-01"
+            link_sumber:
+              type: string
+              example: "https://gorontalo.bps.go.id/..."
+            tags:
+              type: array
+              items:
+                type: string
+              example: ["inflasi", "gorontalo", "2025"]
+            ringkasan:
+              type: string
+              example: "Inflasi Gorontalo pada bulan Oktober 2025 tercatat..."
+    responses:
+      201:
+        description: Data berita berhasil ditambahkan.
+      400:
+        description: Format data salah atau field wajib tidak diisi.
+      401:
+        description: Token tidak valid atau tidak ada (Unauthorized).
     """
     data = request.get_json()
 
@@ -152,6 +226,25 @@ def add_berita():
 def get_berita_by_id(berita_id):
     """
     Endpoint untuk mengambil satu data BeritaBps berdasarkan ID.
+    ---
+    tags:
+      - Berita BPS
+    summary: Mendapatkan detail satu berita berdasarkan ID.
+    security:
+      - Bearer: []
+    parameters:
+      - name: berita_id
+        in: path
+        type: integer
+        required: true
+        description: ID unik dari data berita.
+    responses:
+      200:
+        description: Sukses, mengembalikan detail berita.
+      401:
+        description: Token tidak valid atau tidak ada (Unauthorized).
+      404:
+        description: Data berita tidak ditemukan.
     """
     berita = BeritaBps.query.get(berita_id)
     if not berita:
@@ -171,6 +264,47 @@ def get_berita_by_id(berita_id):
 def update_berita(berita_id):
     """
     Endpoint untuk memperbarui data BeritaBps yang ada.
+    ---
+    tags:
+      - Berita BPS
+    summary: Memperbarui data berita BPS yang ada.
+    security:
+      - Bearer: []
+    parameters:
+      - name: berita_id
+        in: path
+        type: integer
+        required: true
+        description: ID unik dari data berita yang akan diperbarui.
+      - in: body
+        name: body
+        description: Data berita BPS yang akan diperbarui.
+        required: true
+        schema:
+          type: object
+          properties:
+            judul_berita:
+              type: string
+            tanggal_rilis:
+              type: string
+              format: date
+            link_sumber:
+              type: string
+            tags:
+              type: array
+              items:
+                type: string
+            ringkasan:
+              type: string
+    responses:
+      200:
+        description: Data berita berhasil diperbarui.
+      400:
+        description: Format data salah.
+      401:
+        description: Token tidak valid atau tidak ada (Unauthorized).
+      404:
+        description: Data berita tidak ditemukan.
     """
     berita = BeritaBps.query.get(berita_id)
     if not berita:
@@ -211,6 +345,25 @@ def update_berita(berita_id):
 def delete_berita(berita_id):
     """
     Endpoint untuk menghapus data BeritaBps berdasarkan ID.
+    ---
+    tags:
+      - Berita BPS
+    summary: Menghapus data berita BPS berdasarkan ID.
+    security:
+      - Bearer: []
+    parameters:
+      - name: berita_id
+        in: path
+        type: integer
+        required: true
+        description: ID unik dari data berita yang akan dihapus.
+    responses:
+      200:
+        description: Data berita berhasil dihapus.
+      401:
+        description: Token tidak valid atau tidak ada (Unauthorized).
+      404:
+        description: Data berita tidak ditemukan.
     """
     berita = BeritaBps.query.get(berita_id)
     if not berita:

@@ -35,6 +35,40 @@ def format_time_ago(dt):
 @feedback_bp.route('/feedback', methods=['GET'])
 @jwt_required()
 def get_all_feedback():
+    """
+    Mengambil data statistik dan daftar feedback terbaru dengan paginasi.
+    ---
+    tags:
+      - Feedback
+    summary: Mendapatkan data statistik dan daftar feedback (paginasi).
+    security:
+      - Bearer: []
+    parameters:
+      - name: page
+        in: query
+        type: integer
+        description: Nomor halaman untuk paginasi.
+        default: 1
+      - name: per_page
+        in: query
+        type: integer
+        description: Jumlah item per halaman.
+        default: 10
+    responses:
+      200:
+        description: Data feedback berhasil diambil.
+        schema:
+          type: object
+          properties:
+            stats:
+              type: object
+            feedback:
+              type: object
+      401:
+        description: Token tidak valid atau tidak ada (Unauthorized).
+      500:
+        description: Gagal mengambil data feedback.
+    """
     try:
         page = request.args.get('page', 1, type=int)
         per_page = request.args.get('per_page', 10, type=int)
@@ -100,6 +134,43 @@ def get_all_feedback():
 @feedback_bp.route('/feedback', methods=['POST'])
 # @jwt_required()
 def handle_feedback():
+    """
+    Menerima feedback (like/dislike) dari pengguna untuk sebuah respons.
+    ---
+    tags:
+      - Feedback
+    summary: Mengirimkan feedback untuk sebuah respons.
+    parameters:
+      - in: body
+        name: body
+        description: Data feedback yang dikirim oleh pengguna.
+        required: true
+        schema:
+          type: object
+          properties:
+            prompt_log_id:
+              type: string
+              description: "(DEPRECATED - jangan diisi) ID unik pesan dari client."
+            type:
+              type: string
+              enum: ["positive", "negative"]
+              example: "positive"
+            comment:
+              type: string
+              example: "Jawaban ini sangat membantu!"
+            session_id:
+              type: string
+              example: "a1b2c3d4-..."
+              description: "ID unik dari percakapan (conversation_id)."
+    responses:
+      201:
+        description: Feedback berhasil diterima.
+      400:
+        # PERBAIKAN DILAKUKAN DI SINI: Hapus tanda kutip tunggal (' ')
+        description: type atau session_id tidak diisi. 
+      404:
+        description: Log percakapan (PromptLog) tidak ditemukan.
+    """
     data = request.json
     
     # ID ini adalah ID unik untuk PESAN (misal: "35ef4b97...")

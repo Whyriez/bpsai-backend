@@ -139,6 +139,33 @@ def get_combined_relevant_results(user_prompt: str, requested_years: list = [], 
 
 @chat_bp.route('/stream', methods=['POST'])
 def stream():
+    """
+    Memulai stream respons chat (Server-Sent Events).
+    ---
+    tags:
+      - Chat
+    summary: Memulai stream chat RAG.
+    description: Endpoint utama untuk mengirim prompt dan menerima respons streaming.
+    parameters:
+      - in: body
+        name: body
+        description: Prompt pengguna dan ID percakapan.
+        required: true
+        schema:
+          type: object
+          properties:
+            prompt:
+              type: string
+              example: "Berapa tingkat inflasi Gorontalo tahun 2023?"
+            conversation_id:
+              type: string
+              example: "a1b2c3d4-e5f6-7890-a1b2-c3d4e5f67890"
+    responses:
+      200:
+        description: Stream respons (mimetype text/event-stream).
+      400:
+        description: Prompt atau conversation_id tidak diisi.
+    """
     # --- SAKLAR MANUAL UNTUK DEMO ---
     # Ubah nilai ini ke False untuk menonaktifkan SPK dan menggunakan urutan pencarian vektor standar.
     # Ubah ke True untuk mengaktifkan re-ranking dengan SPK-SAW.
@@ -392,6 +419,41 @@ def update_log_after_streaming(app, log_id, model_response, start_time):
 
 @chat_bp.route('/history/<conversation_id>', methods=['GET'])
 def get_history(conversation_id):
+    """
+    Mengambil riwayat percakapan untuk session_id tertentu (paginasi).
+    ---
+    tags:
+      - Chat
+    summary: Mendapatkan riwayat percakapan (paginasi).
+    security:
+      - Bearer: []
+    parameters:
+      - name: conversation_id
+        in: path
+        type: string
+        required: true
+        description: ID unik dari percakapan.
+      - name: page
+        in: query
+        type: integer
+        default: 1
+        description: Nomor halaman untuk paginasi.
+      - name: per_page
+        in: query
+        type: integer
+        default: 20
+        description: Jumlah pesan per halaman.
+    responses:
+      200:
+        description: Riwayat percakapan berhasil diambil.
+      400:
+        description: Conversation ID tidak diisi.
+      401:
+        description: Token tidak valid atau tidak ada (Unauthorized).
+      500:
+        description: Gagal mengambil riwayat.
+    """
+
     page = request.args.get('page', 1, type=int)
     per_page = request.args.get('per_page', 20, type=int)
     
@@ -450,9 +512,40 @@ def sanitize_filename(filename):
 @chat_bp.route('/export/excel', methods=['POST'])
 def export_to_excel():
     """
-    Menerima tabel dalam format Markdown, mengubahnya menjadi file Excel,
-    dan mengirimkannya kembali untuk diunduh.
+    Mengubah tabel Markdown dari chat menjadi file Excel.
     """
+    #  """
+    # Mengubah tabel Markdown dari chat menjadi file Excel.
+    # ---
+    # tags:
+    #   - Chat
+    # summary: Ekspor tabel Markdown ke Excel.
+    # security:
+    #   - Bearer: []
+    # parameters:
+    #   - in: body
+    #     name: body
+    #     description: Tabel Markdown dan judul file.
+    #     required: true
+    #     schema:
+    #       type: object
+    #       properties:
+    #         markdown_table:
+    #           type: string
+    #           example: "| Header 1 | Header 2 |\n|---|---|\n| Data 1 | Data 2 |"
+    #         title:
+    #           type: string
+    #           example: "laporan_inflasi"
+    # responses:
+    #   200:
+    #     description: Mengembalikan file Excel (.xlsx) untuk diunduh.
+    #   400:
+    #     description: Data tabel Markdown tidak ditemukan.
+    #   401:
+    #     description: Token tidak valid atau tidak ada (Unauthorized).
+    #   500:
+    #     description: Gagal memproses dan membuat file Excel.
+    # """
     data = request.json
     markdown_table = data.get('markdown_table')
     title = data.get('title', 'data_ekspor')

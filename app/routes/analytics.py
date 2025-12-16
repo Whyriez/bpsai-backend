@@ -14,6 +14,38 @@ analytics_bp = Blueprint('analytics', __name__, url_prefix='/api/analytics')
 def get_all_analytics():
     """
     Endpoint untuk mengambil semua data yang diperlukan untuk halaman Advanced Analytics.
+    ---
+    tags:
+      - Analytics
+    summary: Mendapatkan semua data agregat untuk halaman analitik.
+    security:
+      - Bearer: []
+    responses:
+      200:
+        description: Berhasil mengambil semua data analitik.
+        schema:
+          type: object
+          properties:
+            usageTrends:
+              type: object
+              description: Data chart untuk tren penggunaan harian (sesi vs interaksi).
+            responseTime:
+              type: object
+              description: Data waktu respons rata-rata dan distribusinya.
+            topKeywords:
+              type: array
+              description: Daftar topik/kata kunci yang paling sering dicari.
+            retrievalSuccessRate:
+              type: number
+              description: Persentase keberhasilan RAG dalam menemukan data.
+            dataCoverage:
+              type: array
+              description: Persentase cakupan data untuk 3 tahun terakhir.
+            servicePerformance:
+              type: object
+              description: KPI performa layanan (uptime, akurasi, kepuasan).
+      401:
+        description: Token tidak valid atau tidak ada (Unauthorized).
     """
      # --- 1. Tren Penggunaan (Usage Trends) ---
     usage_trends_data = {

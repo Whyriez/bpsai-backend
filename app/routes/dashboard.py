@@ -29,8 +29,29 @@ def format_subtitle(change, unit='%', period='dari bulan lalu'):
 @jwt_required()
 def get_kpis():
     """
-    Endpoint untuk mengambil semua data Key Performance Indicators (KPIs)
-    dengan perhitungan perubahan dari periode sebelumnya.
+    Endpoint untuk mengambil semua data Key Performance Indicators (KPIs).
+    ---
+    tags:
+      - Dashboard
+    summary: Mendapatkan 4 KPI utama untuk dashboard.
+    security:
+      - Bearer: []
+    responses:
+      200:
+        description: Berhasil mengambil data KPI.
+        schema:
+          type: object
+          properties:
+            total_sessions:
+              type: object
+            active_users:
+              type: object
+            avg_conversation:
+              type: object
+            feedback_ratio:
+              type: object
+      401:
+        description: Token tidak valid atau tidak ada (Unauthorized).
     """
     now = datetime.utcnow()
     
@@ -104,6 +125,17 @@ def get_kpis():
 def get_questions_frequency():
     """
     Endpoint untuk data frekuensi pertanyaan pengguna per bulan (12 bulan terakhir).
+    ---
+    tags:
+      - Dashboard
+    summary: Data chart untuk frekuensi pertanyaan (12 bulan).
+    security:
+      - Bearer: []
+    responses:
+      200:
+        description: Data chart line untuk frekuensi pertanyaan.
+      401:
+        description: Token tidak valid atau tidak ada (Unauthorized).
     """
     twelve_months_ago = datetime.utcnow() - timedelta(days=365)
     
@@ -146,6 +178,17 @@ def get_questions_frequency():
 def get_intent_distribution():
     """
     Endpoint untuk data distribusi intent.
+    ---
+    tags:
+      - Dashboard
+    summary: Data chart untuk distribusi intent (donut chart).
+    security:
+      - Bearer: []
+    responses:
+      200:
+        description: Data chart donut untuk distribusi intent.
+      401:
+        description: Token tidak valid atau tidak ada (Unauthorized).
     """
     results = db.session.query(
         PromptLog.detected_intent,
@@ -167,6 +210,17 @@ def get_intent_distribution():
 def get_question_types():
     """
     Endpoint untuk data tipe pertanyaan (unik vs berulang).
+    ---
+    tags:
+      - Dashboard
+    summary: Data chart untuk tipe pertanyaan unik vs berulang (pie chart).
+    security:
+      - Bearer: []
+    responses:
+      200:
+        description: Data chart pie untuk tipe pertanyaan.
+      401:
+        description: Token tidak valid atau tidak ada (Unauthorized).
     """
     total_prompts = db.session.query(func.count(PromptLog.id)).scalar() or 0
     
@@ -191,6 +245,27 @@ def get_question_types():
 def get_recent_activity():
     """
     Endpoint untuk mengambil 5 aktivitas (prompt) terbaru.
+    ---
+    tags:
+      - Dashboard
+    summary: Mendapatkan 5 log prompt terbaru.
+    security:
+      - Bearer: []
+    responses:
+      200:
+        description: Daftar 5 prompt terbaru.
+        schema:
+          type: array
+          items:
+            type: object
+            properties:
+              prompt:
+                type: string
+              timestamp:
+                type: string
+                format: date-time
+      401:
+        description: Token tidak valid atau tidak ada (Unauthorized).
     """
     recent_logs = PromptLog.query.order_by(PromptLog.created_at.desc()).limit(5).all()
     

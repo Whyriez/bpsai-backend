@@ -10,6 +10,7 @@ import nltk
 import pytz
 from datetime import datetime
 from .vector_db import register_db_listeners
+from flasgger import Swagger
 
 
 def create_app():
@@ -33,6 +34,27 @@ def create_app():
 
     app.config["JWT_ACCESS_TOKEN_EXPIRES"] = timedelta(hours=1)
     app.config["JWT_REFRESH_TOKEN_EXPIRES"] = timedelta(days=30)
+
+
+    app.config['SWAGGER'] = {
+        'title': 'RAG BPS Backend API',
+        'uiversion': 3,
+        'version': '1.0.0',
+        'description': 'Dokumentasi API untuk RAG Chatbot BPS',
+        'termsOfService': 'http://example.com/terms'
+    }
+
+    app.config['SWAGGER']['securityDefinitions'] = {
+        'Bearer': {
+            'type': 'apiKey',
+            'name': 'Authorization',
+            'in': 'header',
+            'description': 'Masukkan token JWT Anda dengan format: "Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9..."'
+        }
+    }
+    
+    # Inisialisasi Flasgger
+    Swagger(app)
 
     # Inisialisasi ekstensi
     db.init_app(app)

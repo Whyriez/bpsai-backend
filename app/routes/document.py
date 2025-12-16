@@ -23,8 +23,35 @@ HEARTBEAT_INTERVAL = 10
 # @jwt_required()
 def get_all_documents():
     """
-    Mengembalikan daftar semua dokumen yang telah diproses untuk ditampilkan
-    di halaman utama dashboard. (VERSI OPTIMIZED)
+    Mengembalikan daftar semua dokumen yang telah diproses (paginasi).
+    ---
+    tags:
+      - Documents
+    summary: Mendapatkan daftar semua dokumen (paginasi).
+    security:
+      - Bearer: []
+    parameters:
+      - name: page
+        in: query
+        type: integer
+        description: Nomor halaman untuk paginasi.
+        default: 1
+      - name: per_page
+        in: query
+        type: integer
+        description: Jumlah item per halaman.
+        default: 10
+      - name: search
+        in: query
+        type: string
+        description: Kata kunci untuk mencari nama file.
+    responses:
+      200:
+        description: Daftar dokumen berhasil diambil.
+      401:
+        description: Token tidak valid atau tidak ada (Unauthorized).
+      500:
+        description: Gagal mengambil data dokumen.
     """
     try:
         page = request.args.get('page', 1, type=int)
@@ -93,6 +120,41 @@ def get_all_documents():
 def update_document_details(document_id):
     """
     Memperbarui field filename dan/atau link untuk sebuah dokumen.
+    ---
+    tags:
+      - Documents
+    summary: Memperbarui detail (filename/link) dokumen.
+    security:
+      - Bearer: []
+    parameters:
+      - name: document_id
+        in: path
+        type: string
+        format: uuid
+        required: true
+        description: ID unik dari dokumen.
+      - in: body
+        name: body
+        description: Data yang akan diperbarui.
+        required: true
+        schema:
+          type: object
+          properties:
+            filename:
+              type: string
+              example: "Laporan Inflasi Terbaru.pdf"
+            link:
+              type: string
+              example: "http://bps.go.id/laporan/inflasi.pdf"
+    responses:
+      200:
+        description: Detail dokumen berhasil diperbarui.
+      400:
+        description: Request body tidak boleh kosong.
+      404:
+        description: Dokumen tidak ditemukan.
+      500:
+        description: Gagal memperbarui detail dokumen.
     """
     try:
         data = request.get_json()
@@ -126,8 +188,26 @@ def update_document_details(document_id):
 @document_bp.route('/images/<path:filepath>')
 def serve_document_image(filepath):
     """
-    Menyajikan file gambar dari direktori yang dikonfigurasi.
-    Menangani berbagai format path lama yang mungkin tersimpan di database.
+    Menyajikan file gambar (halaman tabel) dari direktori yang dikonfigurasi.
+    ---
+    tags:
+      - Documents
+    summary: Menyajikan gambar halaman dokumen.
+    parameters:
+      - name: filepath
+        in: path
+        type: string
+        format: path
+        required: true
+        # PERBAIKAN DILAKUKAN DI SINI: Gunakan tanda kutip ganda
+        description: "Path relatif ke file gambar (misal: 'nama_dokumen/page_5.png')."
+    responses:
+      200:
+        description: Mengembalikan file gambar.
+      404:
+        description: File gambar tidak ditemukan.
+      500:
+        description: Konfigurasi server error atau gagal menyajikan.
     """
     image_directory = current_app.config.get('PDF_IMAGES_DIRECTORY')
     
@@ -218,6 +298,26 @@ def serve_document_image(filepath):
 def delete_document(document_id):
     """
     Menghapus sebuah dokumen, semua chunk, dan folder gambar terkait.
+    ---
+    tags:
+      - Documents
+    summary: Menghapus dokumen dan semua data terkait.
+    security:
+      - Bearer: []
+    parameters:
+      - name: document_id
+        in: path
+        type: string
+        format: uuid
+        required: true
+        description: ID unik dari dokumen yang akan dihapus.
+    responses:
+      200:
+        description: Dokumen berhasil dihapus.
+      404:
+        description: Dokumen tidak ditemukan.
+      500:
+        description: Gagal menghapus dokumen.
     """
     try:
         doc = db.get_or_404(PdfDocument, document_id)
@@ -252,8 +352,43 @@ def delete_document(document_id):
 # @jwt_required()
 def get_document_pages(document_id):
     """
-    Mengembalikan daftar halaman dari sebuah dokumen, dengan opsi filter
-    untuk menampilkan 'table' atau 'text'.
+    Mengembalikan daftar halaman/chunk dari sebuah dokumen (paginasi).
+    ---
+    tags:
+      - Documents
+    summary: Mendapatkan daftar halaman/chunk dokumen (paginasi).
+    security:
+      - Bearer: []
+    parameters:
+      - name: document_id
+        in: path
+        type: string
+        format: uuid
+        required: true
+        description: ID unik dari dokumen.
+      - name: page
+        in: query
+        type: integer
+        description: Nomor halaman untuk paginasi.
+        default: 1
+      - name: per_page
+        in: query
+        type: integer
+        description: Jumlah item per halaman.
+        default: 10
+      - name: filter
+        in: query
+        type: string
+        description: Filter berdasarkan tipe chunk.
+        enum: ["table", "text"]
+        default: "table"
+    responses:
+      200:
+        description: Daftar halaman/chunk berhasil diambil.
+      404:
+        description: Dokumen tidak ditemukan.
+      500:
+        description: Gagal mengambil detail halaman.
     """
     try:
         doc = db.get_or_404(PdfDocument, document_id)
@@ -309,7 +444,27 @@ def get_document_pages(document_id):
 @jwt_required()
 def get_chunk_details(chunk_id):
     """
-    Mengembalikan data lengkap dari sebuah chunk untuk ditampilkan di modal.
+    Mengembalikan data lengkap dari sebuah chunk (untuk modal edit).
+    ---
+    tags:
+      - Documents
+    summary: Mendapatkan detail lengkap satu chunk.
+    security:
+      - Bearer: []
+    parameters:
+      - name: chunk_id
+        in: path
+        type: string
+        format: uuid
+        required: true
+        description: ID unik dari chunk.
+    responses:
+      200:
+        description: Detail chunk berhasil diambil.
+      404:
+        description: Chunk tidak ditemukan.
+      500:
+        description: Gagal mengambil data chunk.
     """
     try:
         chunk = db.get_or_404(DocumentChunk, chunk_id)
@@ -331,8 +486,29 @@ def get_chunk_details(chunk_id):
 @jwt_required()
 def reconstruct_chunk_content(chunk_id):
     """
-    Menggunakan prompt yang paling canggih untuk menangani hierarki vertikal dan 
-    header yang merentang horizontal (spanning headers).
+    Memicu rekonstruksi AI untuk satu chunk (untuk testing di modal).
+    ---
+    tags:
+      - Documents
+    summary: (AI) Memicu rekonstruksi AI untuk satu chunk.
+    security:
+      - Bearer: []
+    parameters:
+      - name: chunk_id
+        in: path
+        type: string
+        format: uuid
+        required: true
+        description: ID unik dari chunk yang akan direkonstruksi.
+    responses:
+      200:
+        description: Teks berhasil direkonstruksi.
+      404:
+        description: Chunk tidak ditemukan.
+      503:
+        description: Layanan AI tidak terkonfigurasi atau kuota habis.
+      500:
+        description: Gagal memproses.
     """
     try:
         chunk = db.get_or_404(DocumentChunk, chunk_id)
@@ -387,7 +563,39 @@ def reconstruct_chunk_content(chunk_id):
 @jwt_required()
 def update_chunk_content(chunk_id):
     """
-    Menyimpan konten yang sudah direkonstruksi (dan mungkin diedit manual) ke database.
+    Menyimpan konten chunk yang sudah diedit manual ke database.
+    ---
+    tags:
+      - Documents
+    summary: Menyimpan konten chunk yang sudah diedit.
+    security:
+      - Bearer: []
+    parameters:
+      - name: chunk_id
+        in: path
+        type: string
+        format: uuid
+        required: true
+        description: ID unik dari chunk yang akan disimpan.
+      - in: body
+        name: body
+        description: Konten baru yang akan disimpan.
+        required: true
+        schema:
+          type: object
+          properties:
+            content:
+              type: string
+              example: "Ini adalah konten baru yang sudah diedit."
+    responses:
+      200:
+        description: Chunk berhasil diperbarui.
+      400:
+        description: Request body salah (harus ada 'content').
+      404:
+        description: Chunk tidak ditemukan.
+      500:
+        description: Gagal menyimpan perubahan.
     """
     try:
         chunk = db.get_or_404(DocumentChunk, chunk_id)
@@ -548,7 +756,24 @@ def run_pdf_chunking(app, job_name):
 @document_bp.route('/chunking/start', methods=['POST'])
 # @jwt_required()
 def start_chunking_job():
-    """Start chunking job dengan stuck detection."""
+    """
+    Memulai background job untuk memproses semua PDF di folder.
+    ---
+    tags:
+      - Document Jobs (Chunking)
+    summary: Memulai background job pemrosesan PDF.
+    security:
+      - Bearer: []
+    responses:
+      202:
+        description: Proses chunking PDF dimulai.
+      200:
+        description: Tidak ada file PDF baru untuk diproses.
+      409:
+        description: Proses chunking sudah berjalan.
+      500:
+        description: "Gagal memulai proses (misal: folder tidak ada)."
+    """
     job_name = 'pdf_chunking_process'
     
     try:
@@ -624,7 +849,24 @@ def start_chunking_job():
 @document_bp.route('/chunking/stop', methods=['POST'])
 # @jwt_required()
 def stop_chunking_job():
-    """Stop chunking job dengan graceful shutdown."""
+    """
+    Mengirim sinyal berhenti ke background job chunking.
+    ---
+    tags:
+      - Document Jobs (Chunking)
+    summary: Menghentikan background job pemrosesan PDF.
+    security:
+      - Bearer: []
+    responses:
+      200:
+        description: Sinyal berhenti telah dikirim.
+      400:
+        description: Tidak ada proses yang berjalan.
+      404:
+        description: Job tidak ditemukan.
+      500:
+        description: Gagal menghentikan proses.
+    """
     job_name = 'pdf_chunking_process'
     
     try:
@@ -656,7 +898,20 @@ def stop_chunking_job():
 @document_bp.route('/chunking/status', methods=['GET'])
 # @jwt_required()
 def get_chunking_job_status():
-    """Get status dengan stuck detection."""
+    """
+    Mendapatkan status terkini dari background job chunking.
+    ---
+    tags:
+      - Document Jobs (Chunking)
+    summary: Mendapatkan status job pemrosesan PDF.
+    security:
+      - Bearer: []
+    responses:
+      200:
+        description: Status job saat ini.
+      500:
+        description: Gagal mengambil status.
+    """
     job_name = 'pdf_chunking_process'
     
     try:
@@ -702,8 +957,20 @@ def get_chunking_job_status():
 # @jwt_required()
 def reset_stuck_job():
     """
-    ENDPOINT BARU: Reset job yang stuck secara manual.
-    Berguna jika auto-detection tidak bekerja.
+    Mereset job chunking yang macet (stuck) secara manual.
+    ---
+    tags:
+      - Document Jobs (Chunking)
+    summary: Mereset job pemrosesan PDF yang macet.
+    security:
+      - Bearer: []
+    responses:
+      200:
+        description: Job berhasil direset.
+      404:
+        description: Job tidak ditemukan.
+      500:
+        description: Gagal mereset job.
     """
     job_name = 'pdf_chunking_process'
     
@@ -734,8 +1001,19 @@ def reset_stuck_job():
 # @jwt_required()
 def process_pdf_folder():
     """
-    Endpoint untuk memproses semua file PDF dalam folder yang dikonfigurasi.
-    Hanya bisa diakses oleh admin.
+    (DEPRECATED) Memproses semua PDF secara sinkron (blocking).
+    Gunakan /chunking/start untuk proses background.
+    ---
+    tags:
+      - Document Jobs (Chunking)
+    summary: (DEPRECATED) Memproses folder PDF secara sinkron.
+    security:
+      - Bearer: []
+    responses:
+      200:
+        description: Proses sinkron selesai.
+      500:
+        description: Folder tidak ditemukan atau error.
     """
     # Proteksi route: hanya admin yang boleh menjalankan proses ini
     # claims = get_jwt()
@@ -903,7 +1181,29 @@ def run_batch_reconstruction(app, job_name, document_id):
 @document_bp.route('/reconstruct/start/<uuid:document_id>', methods=['POST'])
 @jwt_required()
 def start_batch_reconstruction(document_id):
-    """Memulai proses rekonstruksi untuk semua tabel yang belum diproses."""
+    """
+    Memulai background job rekonstruksi AI untuk semua tabel di dokumen.
+    ---
+    tags:
+      - Document Jobs (Reconstruction)
+    summary: (AI) Memulai background job rekonstruksi untuk dokumen.
+    security:
+      - Bearer: []
+    parameters:
+      - name: document_id
+        in: path
+        type: string
+        format: uuid
+        required: true
+        description: ID unik dari dokumen yang akan direkonstruksi.
+    responses:
+      202:
+        description: Proses rekonstruksi dimulai.
+      200:
+        description: Tidak ada tabel yang perlu direkonstruksi.
+      409:
+        description: Proses rekonstruksi sudah berjalan.
+    """
     job_name = f"reconstruction_doc_{document_id}"
     job = BatchJob.query.filter_by(job_name=job_name).first()
     if not job:
@@ -949,7 +1249,27 @@ def start_batch_reconstruction(document_id):
 @document_bp.route('/reconstruct/stop/<uuid:document_id>', methods=['POST'])
 @jwt_required()
 def stop_batch_reconstruction(document_id):
-    """Mengirim sinyal untuk menghentikan pekerjaan rekonstruksi."""
+    """
+    Mengirim sinyal berhenti ke background job rekonstruksi.
+    ---
+    tags:
+      - Document Jobs (Reconstruction)
+    summary: (AI) Menghentikan background job rekonstruksi.
+    security:
+      - Bearer: []
+    parameters:
+      - name: document_id
+        in: path
+        type: string
+        format: uuid
+        required: true
+        description: ID unik dari dokumen yang prosesnya akan dihentikan.
+    responses:
+      200:
+        description: Sinyal berhenti telah dikirim.
+      404:
+        description: Tidak ada pekerjaan yang sedang berjalan.
+    """
     job_name = f"reconstruction_doc_{document_id}"
     job = BatchJob.query.filter_by(job_name=job_name).first()
     
@@ -964,7 +1284,25 @@ def stop_batch_reconstruction(document_id):
 @document_bp.route('/reconstruct/status/<uuid:document_id>', methods=['GET'])
 @jwt_required()
 def get_batch_reconstruction_status(document_id):
-    """Mendapatkan status terkini dari pekerjaan rekonstruksi (untuk UI)."""
+    """
+    Mendapatkan status terkini dari job rekonstruksi.
+    ---
+    tags:
+      - Document Jobs (Reconstruction)
+    summary: (AI) Mendapatkan status job rekonstruksi.
+    security:
+      - Bearer: []
+    parameters:
+      - name: document_id
+        in: path
+        type: string
+        format: uuid
+        required: true
+        description: ID unik dari dokumen yang statusnya dicek.
+    responses:
+      200:
+        description: Status job saat ini.
+    """
     job_name = f"reconstruction_doc_{document_id}"
     job = BatchJob.query.filter_by(job_name=job_name).first()
 
