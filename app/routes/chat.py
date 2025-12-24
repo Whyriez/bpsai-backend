@@ -15,6 +15,7 @@ from app.helpers import (
     rerank_with_dss, expand_query_with_years
 )
 from sqlalchemy.orm import aliased
+from app import cache
 
 chat_bp = Blueprint('chat', __name__)
 
@@ -25,22 +26,31 @@ def send_thinking_status(status, detail=""):
     """Helper untuk mengirim status thinking ke client"""
     return f"data: {json.dumps({'thinking': True, 'status': status, 'detail': detail})}\n\n"
 
-def get_combined_relevant_results(user_prompt: str, requested_years: list = [], specific_document: str = None, limit: int = 15):
+
+def get_combined_relevant_results(user_prompt: str, requested_years: list = [], specific_document: str = None,
+                                  limit: int = 15):
     """
-    PERBAIKAN: Mengunci pencarian HANYA ke dokumen yang diminta jika specific_document ada.
+    Mengambil hasil gabungan dari BeritaBps dan DocumentChunk dengan strategi:
+    1. Expand query (sinonim & tahun).
+    2. Pre-filtering ChromaDB (untuk tahun).
+    3. Hybrid search (dokumen spesifik vs umum).
     """
+    # 1. Expand Query
     expanded_prompt = expand_query_with_synonyms(user_prompt, BPS_ACRONYM_DICTIONARY)
-    
+
+    # Cek apakah user meminta dokumen spesifik (jika belum terdeteksi sebelumnya)
     if not specific_document:
         doc_pattern = re.search(r'(?:dokumen|file|pdf)\s+([\w\s\-\.]+)', user_prompt, re.IGNORECASE)
         if doc_pattern:
             specific_document = doc_pattern.group(1)
 
+    # Tambahkan tahun ke prompt agar embedding lebih sadar konteks waktu
     if requested_years:
         expanded_prompt = expand_query_with_years(expanded_prompt, requested_years)
 
     current_app.logger.info(f"Original prompt: '{user_prompt}', Expanded to: '{expanded_prompt}'")
-    
+
+    # Generate Embedding
     prompt_embedding = embedding_service.generate(expanded_prompt)
     if not prompt_embedding:
         return []
@@ -48,92 +58,119 @@ def get_combined_relevant_results(user_prompt: str, requested_years: list = [], 
     berita_collection, document_collection = get_collections()
     combined_results = []
 
-    # ===================================================================
-    # LOGIKA BARU: Cek apakah pencarian spesifik ke satu dokumen
-    # ===================================================================
+    # --- KONSTRUKSI FILTER TAHUN (FIX FATAL #1) ---
+    # Kita buat filter untuk ChromaDB agar HANYA mengambil data di tahun yang diminta
+    berita_where_filter = None
+    if requested_years:
+        min_year = min(requested_years)
+        max_year = max(requested_years)
+
+        # Filter range tanggal ISO (YYYY-MM-DD)
+        # ChromaDB mendukung operator $gte (>=) dan $lte (<=) untuk string tanggal
+        berita_where_filter = {
+            "$and": [
+                {"year": {"$gte": min_year}},
+                {"year": {"$lte": max_year}}
+            ]
+        }
+        current_app.logger.info(f"Applying ChromaDB Filter: {berita_where_filter}")
+
+    # --- LOGIKA PENCARIAN ---
+
+    # KASUS A: PENCARIAN DOKUMEN SPESIFIK
     if specific_document:
         current_app.logger.info(f"MODE PENCARIAN SPESIFIK: Mengunci pencarian ke dokumen '{specific_document}'")
-        
-        # 1. Lakukan vector search HANYA pada collection dokumen
+
+        # 1. Vector Search pada DocumentChunk
         chunk_results = document_collection.query(
             query_embeddings=[prompt_embedding],
-            n_results=limit * 2 # Ambil lebih banyak untuk difilter
+            n_results=limit * 2  # Ambil lebih banyak untuk difilter manual nama filenya
         )
 
-        # 2. Filter dengan sangat ketat
+        # 2. Filter hasil berdasarkan nama file
         if chunk_results['ids'][0]:
             for i, item_id in enumerate(chunk_results['ids'][0]):
                 distance = chunk_results['distances'][0][i]
                 chunk_obj = db.session.get(DocumentChunk, item_id)
-                
+
                 if chunk_obj and chunk_obj.document:
-                    # Normalisasi nama untuk matching yang lebih fleksibel
+                    # Normalisasi nama untuk matching
                     doc_filename = chunk_obj.document.filename.lower().replace('.pdf', '')
                     search_term = specific_document.lower().replace('.pdf', '')
-                    
-                    # Hanya tambahkan jika nama file MENGANDUNG search term
+
                     if search_term in doc_filename:
                         combined_results.append((chunk_obj, distance))
-                        current_app.logger.debug(f"✓ Ditemukan & Cocok: {chunk_obj.document.filename} (Hal: {chunk_obj.page_number})")
-                    else:
-                        current_app.logger.debug(f"✗ Ditemukan tapi Ditolak: {chunk_obj.document.filename} (tidak cocok dengan '{search_term}')")
-        
-        # 3. Fallback jika tidak ada hasil sama sekali
+                        current_app.logger.debug(f"✓ Cocok: {chunk_obj.document.filename}")
+
+        # 3. Fallback: SQL Search jika Vector gagal menemukan dokumen spesifik
         if not combined_results:
-            current_app.logger.warning(f"Tidak ada hasil dari vector search untuk '{specific_document}', mencoba query DB langsung.")
+            current_app.logger.warning(f"Vector search kosong untuk '{specific_document}', mencoba SQL query.")
             from sqlalchemy import func
             direct_chunks = DocumentChunk.query.join(PdfDocument).filter(
                 func.lower(PdfDocument.filename).contains(specific_document.lower())
             ).limit(10).all()
-            
+
             for chunk in direct_chunks:
-                combined_results.append((chunk, 0.7)) # Beri skor jarak default
+                combined_results.append((chunk, 0.7))  # Beri skor jarak default
 
+    # KASUS B: PENCARIAN UMUM (SEMUA DATA)
     else:
-        # ===================================================================
-        # LOGIKA LAMA: Pencarian umum jika tidak ada dokumen spesifik
-        # ===================================================================
         current_app.logger.info("MODE PENCARIAN UMUM: Mencari di semua sumber data.")
-        
-        # Query ke collection BeritaBps
+
+        # 1. Query BeritaBps DENGAN FILTER TAHUN (Ini perbaikan utamanya)
         berita_results = berita_collection.query(
-            query_embeddings=[prompt_embedding], n_results=limit
+            query_embeddings=[prompt_embedding],
+            n_results=limit,
+            where=berita_where_filter  # Filter diterapkan di level DB
         )
 
-        # Query ke collection DocumentChunk
+        # 2. Query DocumentChunk
+        # (PDF saat ini belum punya metadata tahun di Chroma, jadi ambil raw dulu)
         chunk_results = document_collection.query(
-            query_embeddings=[prompt_embedding], n_results=limit * 2
+            query_embeddings=[prompt_embedding],
+            n_results=limit * 2
         )
-        
-        # Proses hasil berita
+
+        # Proses Hasil Berita
         if berita_results['ids'][0]:
             for i, item_id in enumerate(berita_results['ids'][0]):
                 distance = berita_results['distances'][0][i]
-                berita_obj = db.session.get(BeritaBps, int(item_id)) 
+                berita_obj = db.session.get(BeritaBps, int(item_id))
                 if berita_obj:
-                    if requested_years and berita_obj.tanggal_rilis.year not in requested_years:
-                        continue # Lewati jika tahun tidak cocok
+                    # Tidak perlu filter tahun manual lagi di sini karena sudah di DB
                     combined_results.append((berita_obj, distance))
-        
-        # Proses hasil chunk
+
+        # Proses Hasil Chunk (PDF)
         if chunk_results['ids'][0]:
             for i, item_id in enumerate(chunk_results['ids'][0]):
                 distance = chunk_results['distances'][0][i]
                 chunk_obj = db.session.get(DocumentChunk, item_id)
                 if chunk_obj and chunk_obj.document:
-                    combined_results.append((chunk_obj, distance))
+                    # Fallback filter tahun manual untuk PDF (karena metadata belum lengkap)
+                    doc_year_match = re.search(r'20\d{2}', chunk_obj.document.filename)
+                    penalty = 0
 
-    # Jika ada permintaan tahun spesifik dan hasil masih kurang, lakukan fallback
-    if requested_years and len(combined_results) < len(requested_years) and not specific_document:
-        current_app.logger.warning(f"Hasil kurang untuk tahun {requested_years}, mencoba fallback query.")
+                    if requested_years and doc_year_match:
+                        doc_year = int(doc_year_match.group(0))
+                        if doc_year not in requested_years:
+                            # Kita tidak skip total, tapi beri penalti agar prioritas turun
+                            penalty = 0.5
+
+                    combined_results.append((chunk_obj, distance + penalty))
+
+    # Jika hasil masih sangat sedikit untuk tahun yang diminta, lakukan fallback SQL
+    if requested_years and len(combined_results) < 3 and not specific_document:
+        current_app.logger.warning(f"Hasil kurang untuk tahun {requested_years}, mencoba fallback SQL query.")
         for year in requested_years:
             additional_news = BeritaBps.query.filter(
                 db.extract('year', BeritaBps.tanggal_rilis) == year
             ).limit(3).all()
             for news in additional_news:
+                # Cek duplikasi sebelum append
                 if not any(isinstance(item, BeritaBps) and item.id == news.id for item, _ in combined_results):
-                    combined_results.append((news, 0.5))
+                    combined_results.append((news, 0.6))  # Skor default
 
+    # Sort berdasarkan jarak (semakin kecil semakin relevan)
     combined_results.sort(key=lambda x: x[1])
     return combined_results[:limit]
 
@@ -179,6 +216,40 @@ def stream():
 
     if not user_prompt or not session_id:
         return Response(json.dumps({'error': 'Prompt and conversation_id are required'}), status=400, mimetype='application/json')
+
+    cached_response_text = cache.get(user_prompt)
+
+    if cached_response_text:
+        current_app.logger.info(f"CACHE HIT: Mengambil jawaban dari cache untuk prompt: '{user_prompt}'")
+
+        # Log tetap dibuat agar riwayat chat tersimpan
+        log = PromptLog(
+            user_prompt=user_prompt,
+            session_id=session_id,
+            detected_intent="cache_hit",
+            model_response=cached_response_text,  # Langsung simpan jawaban
+            processing_time_ms=0,
+            found_results=True
+        )
+        db.session.add(log)
+        db.session.commit()
+
+        def generate_from_cache():
+            # Simulasi status "thinking" sejenak (agar UX konsisten)
+            yield send_thinking_status("cached", "Menemukan jawaban di memori (Cache Hit)...")
+            yield f"data: {json.dumps({'thinking': False})}\n\n"
+
+            # Simulasi streaming (pecah teks jadi chunk kecil) agar efek ketikan tetap ada
+            chunk_size = 50
+            for i in range(0, len(cached_response_text), chunk_size):
+                chunk = cached_response_text[i:i + chunk_size]
+                sse_chunk = json.dumps({"text": chunk})
+                yield f"data: {sse_chunk}\n\n"
+                # time.sleep(0.01) # Opsional: jeda dikit biar lebih smooth
+
+            yield "data: [DONE]\n\n"
+
+        return Response(generate_from_cache(), mimetype='text/event-stream')
 
     db.session.expire_all()
 
@@ -226,7 +297,7 @@ def stream():
                     user_prompt, 
                     requested_years=requested_years, 
                     specific_document=specific_doc,
-                    limit=20
+                    limit=80
                 )
                 
                 relevant_items = []

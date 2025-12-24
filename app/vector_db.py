@@ -74,15 +74,16 @@ def sync_berita_to_chroma(mapper, connection, target):
 
     try:
         berita_col, _ = get_collections()
-
         embedding_list = target.embedding.tolist() if isinstance(target.embedding, np.ndarray) else target.embedding
 
         berita_col.upsert(
             ids=[str(target.id)],
             embeddings=[embedding_list],
-            metadatas=[
-                {"judul": target.judul_berita, "tanggal_rilis": str(target.tanggal_rilis)}
-            ]
+            metadatas=[{
+                "judul": target.judul_berita,
+                "tanggal_rilis": str(target.tanggal_rilis),
+                "year": int(target.tanggal_rilis.year)  # <--- TAMBAHKAN INI (Integer)
+            }]
         )
         logging.info(f"Berhasil upsert BeritaBps ID {target.id} ke ChromaDB.")
     except Exception as e:

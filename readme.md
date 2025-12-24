@@ -5,5 +5,7 @@ Command
 - flask user:create-admin "siti.aminah@bps.go.id" "siti"
 
 server side:
+- venv/bin/python run
 - venv/bin/pip install flasgger
+- - venv/bin/pip install Flask-Caching
 - ./venv/bin/flask user:create-admin "fitra@bps.go.id" "fitra"
