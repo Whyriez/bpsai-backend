@@ -22,7 +22,7 @@ Lakukan langkah-langkah ini untuk menyiapkan environment backend dari nol.
 
 ```bash
 # 1. Clone repository (jika belum)
-git clone https://github.com/Whyriez/bpsai-backend.git
+git clone [https://github.com/username/bpsai-backend.git](https://github.com/username/bpsai-backend.git)
 cd bpsai-backend
 
 # 2. Buat Virtual Environment
@@ -56,14 +56,34 @@ venv/bin/pip install gunicorn
 Buat file `.env` di root folder aplikasi dan sesuaikan konfigurasi berikut:
 
 ```env
-FLASK_APP=run.py
-FLASK_ENV=production
-DATABASE_URL=postgresql://user:password@localhost:5432/nama_database_anda
-JWT_SECRET_KEY=isi_random_secret_key_yang_panjang
-GEMINI_API_KEY_1=isi_api_key_google_anda
-# Opsi lain (default sudah diatur di config):
-# PDF_CHUNK_DIRECTORY=data/onlineData/pdf
-# PDF_IMAGES_DIRECTORY=data/onlineData/png
+# Database Configuration
+DATABASE_URL="postgresql://postgres@localhost:5432/bpsai"
+
+# ChromaDB Configuration (Vector Database)
+CHROMA_HOST=127.0.0.1
+CHROMA_PORT=8000
+
+# Seeding Configuration (Default Admin)
+SEED_ADMIN_EMAIL=
+SEED_ADMIN_USERNAME=
+
+# Security
+JWT_SECRET_KEY=ganti-dengan-kunci-rahasia-anda-yang-panjang
+
+# Data Directories
+PDF_CHUNK_DIRECTORY=data/onlineData/pdf
+PDF_IMAGES_DIRECTORY=data/onlineData/png
+
+# App Settings
+ENVIRONMENT=development
+LANG=en_US.UTF-8
+LC_ALL=en_US.UTF-8
+PYTHONIOENCODING=utf-8
+
+# Google Gemini API Keys (Multi-Key Support)
+GEMINI_API_KEY_1=AIzaSy... (Isi dengan API Key Google Anda)
+GEMINI_API_KEY_2=AIzaSy...
+GEMINI_API_KEY_3=AIzaSy...
 ```
 
 ---
@@ -99,11 +119,11 @@ Membuat user baru dengan role Administrator untuk akses dashboard.
 ```bash
 # Format: flask user:create-admin "EMAIL" "PASSWORD"
 
-# Contoh 1 (Ibu Siti)
-venv/bin/flask user:create-admin "siti.aminah@bps.go.id" "siti"
-
-# Contoh 2 (Mas Fitra)
+# Contoh 1 (Default sesuai .env)
 venv/bin/flask user:create-admin "fitra@bps.go.id" "fitra"
+
+# Contoh 2 (User Lain)
+venv/bin/flask user:create-admin "siti.aminah@bps.go.id" "siti"
 ```
 
 ### 📥 Import Data Scraping
