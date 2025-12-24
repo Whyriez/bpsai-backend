@@ -23,3 +23,5 @@ nltk==3.9.2           # Natural Language Toolkit untuk stopwords
 click==8.3.0         # Untuk membuat command-line interface
 pytz==2025.2
 cachetools==6.2.0
+
+Flask-Caching

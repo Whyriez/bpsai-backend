@@ -11,7 +11,9 @@ import pytz
 from datetime import datetime
 from .vector_db import register_db_listeners
 from flasgger import Swagger
+from flask_caching import Cache
 
+cache = Cache()
 
 def create_app():
     load_dotenv()
@@ -26,6 +28,9 @@ def create_app():
     # app.config['SECRET_KEY'] = os.getenv('SECRET_KEY', 'a-super-secret-key')
     app.config["JWT_SECRET_KEY"] = os.getenv('JWT_SECRET_KEY')
 
+    app.config['CACHE_TYPE'] = 'SimpleCache'
+    app.config['CACHE_DEFAULT_TIMEOUT'] = 3600
+
     # app.config['PDF_IMAGES_DIRECTORY'] = os.path.join(app.static_folder, 'pdf_images')
     # app.config['PDF_CHUNK_DIRECTORY'] = os.getenv('PDF_CHUNK_DIRECTORY', 'data/chunkPdf') 
     app.config['PDF_CHUNK_DIRECTORY'] = os.getenv('PDF_CHUNK_DIRECTORY', 'data/onlineData/pdf') 
@@ -35,6 +40,7 @@ def create_app():
     app.config["JWT_ACCESS_TOKEN_EXPIRES"] = timedelta(hours=1)
     app.config["JWT_REFRESH_TOKEN_EXPIRES"] = timedelta(days=30)
 
+    cache.init_app(app)
 
     app.config['SWAGGER'] = {
         'title': 'RAG BPS Backend API',

@@ -492,15 +492,17 @@ class RobustTableDetector:
 
 def process_and_save_pdf(pdf_path: str, job_id: int = None, progress_callback=None) -> Dict[str, Any]:
     """
-    Memproses PDF dengan logika resume dan commit per halaman untuk memastikan
-    integritas data saat proses dihentikan atau gagal.
+    Memproses PDF dengan strategi Hybrid Chunking:
+    1. Halaman Tabel/Gambar -> Disimpan utuh per halaman (agar struktur tabel tidak rusak).
+    2. Halaman Teks -> Di-buffer (digabung) lalu di-chunk pakai Sliding Window (agar kalimat utuh).
     """
     base_filename = os.path.splitext(os.path.basename(pdf_path))[0]
     original_filename = os.path.basename(pdf_path)
-    
+
     document = None
     start_page = 1
-    
+
+    # --- 1. INISIALISASI & CEK DUPLIKASI/RESUME ---
     try:
         file_hash = hashlib.sha256(open(pdf_path, "rb").read()).hexdigest()
         document = PdfDocument.query.filter_by(document_hash=file_hash).first()
@@ -510,93 +512,211 @@ def process_and_save_pdf(pdf_path: str, job_id: int = None, progress_callback=No
         doc_for_pages.close()
 
         if document:
-            last_chunk = DocumentChunk.query.filter_by(document_id=document.id)\
+            # Cek chunk terakhir untuk resume
+            last_chunk = DocumentChunk.query.filter_by(document_id=document.id) \
                 .order_by(DocumentChunk.page_number.desc()).first()
-            
+
             if last_chunk:
                 if last_chunk.page_number >= total_pages:
                     logging.info(f"Skipping '{original_filename}': Sudah selesai diproses.")
-                    return {"status": "skipped", "filename": original_filename, "reason": "Dokumen sudah selesai diproses."}
-                
+                    return {"status": "skipped", "filename": original_filename,
+                            "reason": "Dokumen sudah selesai diproses."}
+
+                # Resume dari halaman berikutnya
                 start_page = last_chunk.page_number + 1
                 logging.info(f"Resuming '{original_filename}' from page {start_page}.")
             else:
-                 start_page = 1
+                start_page = 1
         else:
+            # Buat entry dokumen baru
             document = PdfDocument(
                 filename=original_filename,
                 total_pages=total_pages,
                 document_hash=file_hash,
                 doc_metadata={'source_path': pdf_path}
             )
-            
+
     except Exception as e:
         logging.error(f"Gagal saat inisialisasi pra-proses untuk {pdf_path}: {e}")
         return {"status": "error", "filename": original_filename, "reason": f"Initialization error: {str(e)}"}
 
+    # --- 2. MULAI PEMROSESAN UTAMA ---
     detector = RobustTableDetector()
     doc = fitz.open(pdf_path)
-    
+
+    # Buffer teks untuk context windowing (FIX FATAL #2)
+    text_buffer = ""
+    # Menandai dari halaman mana buffer ini dimulai (untuk metadata aproksimasi)
+    buffer_start_page = start_page
+
     for page_num, page in enumerate(doc, 1):
         if page_num < start_page:
             continue
 
         try:
+            # Cek interupsi job (tombol stop)
             if job_id and check_job_should_stop(job_id):
                 doc.close()
-                logging.info(f"Proses dihentikan oleh pengguna sebelum halaman {page_num} pada file '{original_filename}'. Progress tersimpan.")
-                return {"status": "stopped", "filename": original_filename, "reason": f"Dihentikan oleh pengguna pada halaman {page_num}"}
+                logging.info(f"Proses dihentikan oleh pengguna sebelum halaman {page_num}.")
+                return {"status": "stopped", "filename": original_filename,
+                        "reason": f"Dihentikan oleh pengguna pada halaman {page_num}"}
 
             if progress_callback:
-                message = f"Menganalisis Halaman {page_num}/{total_pages} (File: {original_filename})"
-                progress_callback(message=message)
+                progress_callback(message=f"Menganalisis Halaman {page_num}/{total_pages} (File: {original_filename})")
 
-            text_blocks = page.get_text("blocks")
+            # Ekstrak Teks & Deteksi Tabel
+            raw_text = page.get_text("text")
+            is_table, reason = detector._detect_table_page(raw_text, page_num)
 
-            raw_text = ""
-            is_table = False
-            reason = ""
-
-            if not text_blocks:
-                logging.warning(f"Halaman {page_num} di file '{original_filename}' tidak memiliki teks, dianggap sebagai gambar.")
-                raw_text = ""
-                is_table = True
-                reason = "image_only_page"
-            else:
-                raw_text = page.get_text("text")
-                is_table, reason = detector._detect_table_page(raw_text, page_num)
-            
             if reason == "excluded_page":
                 continue
 
-            content_type = "table" if is_table else "text"
-            image_path = None
-            if is_table:
-                image_path = detector._save_page_screenshot(page, base_filename, page_num)
-
+            # Pastikan dokumen tersimpan di DB sebelum insert chunk
             if not document.id:
                 db.session.add(document)
                 db.session.flush()
 
-            new_chunk = DocumentChunk(
-                document_id=document.id,
-                page_number=page_num,
-                chunk_content=detector._clean_text_for_rag(raw_text),
-                chunk_metadata={
-                    "type": content_type,
-                    "image_path": image_path,
-                    "detection_reason": reason,
-                    "is_excluded": False
-                }
-            )
-            db.session.add(new_chunk)
-            db.session.commit()
+            # --- LOGIKA HYBRID CHUNKING ---
+
+            # KONDISI A: HALAMAN TABEL / GAMBAR PENUH
+            # Jika halaman ini tabel, kita harus "flush" (simpan) buffer teks sebelumnya dulu.
+            if is_table or reason == "image_only_page":
+
+                # 1. Simpan sisa buffer teks (jika ada) sebelum masuk ke tabel
+                if text_buffer:
+                    text_chunks = semantic_sliding_window_chunker(text_buffer)
+                    for txt_content in text_chunks:
+                        chunk_obj = DocumentChunk(
+                            document_id=document.id,
+                            page_number=buffer_start_page,  # Aproksimasi halaman
+                            chunk_content=txt_content,
+                            chunk_metadata={"type": "text", "source": "buffered_text"}
+                        )
+                        db.session.add(chunk_obj)
+
+                    text_buffer = ""  # Reset buffer
+
+                # 2. Simpan Halaman Tabel ini secara UTUH (jangan dipotong sliding window)
+                # Agar struktur tabel/gambar tetap terjaga dan bisa direkonstruksi nanti
+                image_path = detector._save_page_screenshot(page, base_filename, page_num)
+
+                table_chunk = DocumentChunk(
+                    document_id=document.id,
+                    page_number=page_num,
+                    chunk_content=detector._clean_text_for_rag(raw_text),
+                    chunk_metadata={
+                        "type": "table" if is_table else "image",
+                        "image_path": image_path,
+                        "detection_reason": reason,
+                        "is_excluded": False
+                    }
+                )
+                db.session.add(table_chunk)
+                db.session.commit()  # Commit tabel langsung
+
+                # Reset penanda buffer untuk halaman teks berikutnya
+                buffer_start_page = page_num + 1
+                continue
+
+                # KONDISI B: HALAMAN TEKS BIASA
+            # Jangan simpan dulu! Masukkan ke buffer agar kalimat di akhir halaman bisa nyambung.
+            cleaned_text = detector._clean_text_for_rag(raw_text)
+            text_buffer += " " + cleaned_text
+
+            # Optimasi: Jika buffer sudah terlalu besar (misal > 3 halaman / 5000 chars),
+            # kita proses sebagian untuk menghemat memori, tapi sisakan ujungnya untuk overlap.
+            if len(text_buffer) > 5000:
+                text_chunks = semantic_sliding_window_chunker(text_buffer)
+
+                # Ambil chunk terakhir untuk dimasukkan kembali ke buffer (agar overlap terjaga)
+                if text_chunks:
+                    last_chunk_to_keep = text_chunks.pop()
+
+                    for txt_content in text_chunks:
+                        chunk_obj = DocumentChunk(
+                            document_id=document.id,
+                            page_number=page_num,  # Aproksimasi
+                            chunk_content=txt_content,
+                            chunk_metadata={"type": "text"}
+                        )
+                        db.session.add(chunk_obj)
+
+                    # Sisanya kembalikan ke buffer
+                    text_buffer = last_chunk_to_keep
+                    db.session.commit()  # Commit partial
 
         except Exception as e:
             db.session.rollback()
             doc.close()
             logging.error(f"Gagal memproses halaman {page_num} dari '{pdf_path}': {e}")
             return {"status": "error", "filename": original_filename, "reason": f"Error on page {page_num}: {str(e)}"}
-            
+
+    # --- 3. FLUSH BUFFER TERAKHIR (SANGAT PENTING) ---
+    # Setelah loop selesai, kemungkinan masih ada teks tersisa di buffer
+    if text_buffer:
+        text_chunks = semantic_sliding_window_chunker(text_buffer)
+        for txt_content in text_chunks:
+            chunk_obj = DocumentChunk(
+                document_id=document.id,
+                page_number=total_pages,  # Tandai sebagai halaman akhir
+                chunk_content=txt_content,
+                chunk_metadata={"type": "text", "source": "final_buffer"}
+            )
+            db.session.add(chunk_obj)
+        db.session.commit()
+
     doc.close()
     return {"status": "success", "filename": original_filename, "pages_chunked": total_pages - start_page + 1}
+
+
+def semantic_sliding_window_chunker(text: str, chunk_size: int = 1000, overlap: int = 200) -> List[str]:
+    """
+    Memecah teks menjadi chunk dengan overlap.
+    Berusaha memotong di akhir kalimat (titik, tanda tanya, seru) agar konteks utuh.
+    """
+    if not text:
+        return []
+
+    # Bersihkan multiple spasi/newline berlebih
+    text = re.sub(r'\s+', ' ', text).strip()
+
+    chunks = []
+    start = 0
+    text_len = len(text)
+
+    while start < text_len:
+        end = start + chunk_size
+
+        # Jika sisa teks kurang dari chunk_size, ambil semuanya
+        if end >= text_len:
+            chunks.append(text[start:])
+            break
+
+        # Cari titik pemisah yang baik (titik, tanda tanya, seru) MUNDUR dari posisi 'end'
+        last_period = text.rfind('.', start, end)
+        last_question = text.rfind('?', start, end)
+        last_exclamation = text.rfind('!', start, end)
+
+        # Ambil posisi tanda baca terjauh (paling mendekati akhir chunk)
+        split_point = max(last_period, last_question, last_exclamation)
+
+        # Aturan pemotongan:
+        # Split point harus valid (!=-1) DAN
+        # Split point tidak boleh terlalu di awal (minimal 50% chunk terisi)
+        if split_point != -1 and split_point > start + (chunk_size * 0.5):
+            end = split_point + 1  # Sertakan tanda bacanya
+        else:
+            # Jika tidak ada tanda baca yang pas, cari spasi terdekat
+            last_space = text.rfind(' ', start, end)
+            if last_space != -1:
+                end = last_space
+
+        chunk_content = text[start:end].strip()
+        if chunk_content:
+            chunks.append(chunk_content)
+
+        # Geser pointer start untuk chunk berikutnya
+        # Kita mundur sebesar 'overlap' dari posisi end saat ini
+        start = max(start + 1, end - overlap)
+
+    return chunks
